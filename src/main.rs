@@ -18,7 +18,7 @@ use std::{
 
 const SPLASH: f64 = 2.6;
 const GB: f64 = 1073741824.0;
-const VOL: f32 = 0.35;
+const VOL: f32 = 0.8;
 const SR: f32 = 44100.0;
 const BASES: [&str; 2] = [
     "https://cdn.cloudflare.steamstatic.com/steam/apps",
@@ -27,6 +27,11 @@ const BASES: [&str; 2] = [
 const CORNERS: [&str; 4] = ["Top-left", "Top-right", "Bottom-left", "Bottom-right"];
 
 type Stats = Arc<Mutex<Map<String, Value>>>;
+
+const ACC: Color32 = Color32::from_rgb(76, 134, 255);
+fn fb(sz: f32) -> FontId {
+    FontId::new(sz, FontFamily::Name("bold".into()))
+}
 
 #[derive(Clone, PartialEq)]
 enum Kind {
@@ -53,6 +58,7 @@ struct Meta {
 #[derive(Default)]
 struct Assets {
     poster: Option<TextureHandle>,
+    poster_s: Option<TextureHandle>,
     hero: Option<TextureHandle>,
     blur: Option<TextureHandle>,
     logo: Option<TextureHandle>,
@@ -61,7 +67,7 @@ struct Assets {
 }
 
 enum Msg {
-    Poster(ColorImage),
+    Poster(ColorImage, ColorImage),
     Hero(ColorImage, ColorImage),
     Logo(ColorImage),
     Meta(Meta),
@@ -253,17 +259,58 @@ impl Sfx {
     }
 }
 
-fn tone(dur: f32, f0: f32, f1: f32, vol: f32, atk: f32) -> Vec<f32> {
+struct Rng(u32);
+impl Rng {
+    fn next(&mut self) -> f32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
+        self.0 as f32 / u32::MAX as f32 * 2.0 - 1.0
+    }
+}
+
+fn lowpass(v: &mut [f32], hz: f32) {
+    let a = 1.0 - (-2.0 * std::f32::consts::PI * hz / SR).exp();
+    let mut y = 0.0;
+    for x in v.iter_mut() {
+        y += a * (*x - y);
+        *x = y;
+    }
+}
+
+/// Soft bell-like note: sine + faint octave + faint inharmonic partial, smooth attack, exponential decay.
+fn note(dur: f32, f0: f32, f1: f32, vol: f32, atk: f32, decay: f32) -> Vec<f32> {
     let n = (dur * SR) as usize;
-    let mut ph = 0.0f32;
+    let tau = 2.0 * std::f32::consts::PI;
+    let (mut p1, mut p2, mut p3) = (0.0f32, 0.0f32, 0.0f32);
     let mut v = Vec::with_capacity(n);
     for i in 0..n {
         let t = i as f32 / SR;
         let k = i as f32 / n as f32;
-        ph += 2.0 * std::f32::consts::PI * (f0 + (f1 - f0) * k) / SR;
-        let env = (t / atk).min(1.0) * (1.0 - k).powf(2.0);
-        v.push((ph.sin() + 0.25 * (ph * 2.0).sin()) * env * vol);
+        let f = f0 + (f1 - f0) * k;
+        p1 += tau * f / SR;
+        p2 += tau * f * 2.0 / SR;
+        p3 += tau * f * 2.76 / SR;
+        let a = if t < atk { 0.5 - 0.5 * (std::f32::consts::PI * t / atk).cos() } else { 1.0 };
+        let tail = ((1.0 - k) / 0.1).min(1.0);
+        let e = a * (-t * decay).exp() * tail;
+        let s = p1.sin() + 0.22 * p2.sin() * (-t * decay * 1.8).exp() + 0.10 * p3.sin() * (-t * decay * 3.0).exp();
+        v.push(s * e * vol);
     }
+    v
+}
+
+/// Soft filtered-noise "air" burst.
+fn puff(dur: f32, hz: f32, vol: f32, seed: u32) -> Vec<f32> {
+    let n = (dur * SR) as usize;
+    let mut r = Rng(seed | 1);
+    let mut v: Vec<f32> = (0..n)
+        .map(|i| {
+            let k = i as f32 / n as f32;
+            r.next() * (std::f32::consts::PI * k).sin().powi(2) * vol
+        })
+        .collect();
+    lowpass(&mut v, hz);
     v
 }
 
@@ -277,57 +324,125 @@ fn mix(dst: &mut Vec<f32>, src: &[f32], at: f32) {
     }
 }
 
-fn synth(s: Sfx) -> Vec<f32> {
-    let mut o: Vec<f32> = vec![];
-    match s {
-        Sfx::Move => mix(&mut o, &tone(0.045, 1400.0, 1100.0, 0.5, 0.003), 0.0),
-        Sfx::Bump => mix(&mut o, &tone(0.06, 220.0, 160.0, 0.6, 0.003), 0.0),
-        Sfx::Tick => mix(&mut o, &tone(0.02, 2200.0, 2000.0, 0.35, 0.002), 0.0),
-        Sfx::Tab => mix(&mut o, &tone(0.07, 900.0, 1150.0, 0.45, 0.004), 0.0),
-        Sfx::Select => {
-            mix(&mut o, &tone(0.09, 660.0, 660.0, 0.5, 0.004), 0.0);
-            mix(&mut o, &tone(0.16, 990.0, 990.0, 0.5, 0.004), 0.07);
+/// Small room reverb (4 feedback combs) for the airy, "console UI" feel.
+fn reverb(v: &mut Vec<f32>, wet: f32, tail: f32) {
+    v.resize(v.len() + (tail * SR) as usize, 0.0);
+    let dry = v.clone();
+    for (d, g) in [(0.0297f32, 0.62f32), (0.0371, 0.58), (0.0411, 0.54), (0.0437, 0.5)] {
+        let dl = (d * SR) as usize;
+        let mut buf = dry.clone();
+        for i in dl..buf.len() {
+            buf[i] += buf[i - dl] * g;
         }
-        Sfx::Back => {
-            mix(&mut o, &tone(0.08, 700.0, 700.0, 0.45, 0.004), 0.0);
-            mix(&mut o, &tone(0.12, 480.0, 480.0, 0.45, 0.004), 0.06);
-        }
-        Sfx::Fav => {
-            for (f, at) in [(880.0, 0.0), (1109.0, 0.06), (1319.0, 0.12)] {
-                mix(&mut o, &tone(0.14, f, f, 0.4, 0.004), at);
-            }
-        }
-        Sfx::Unfav => {
-            for (f, at) in [(1109.0, 0.0), (880.0, 0.07)] {
-                mix(&mut o, &tone(0.12, f, f, 0.4, 0.004), at);
-            }
-        }
-        Sfx::Open => mix(&mut o, &tone(0.2, 380.0, 820.0, 0.45, 0.02), 0.0),
-        Sfx::Close => mix(&mut o, &tone(0.16, 820.0, 380.0, 0.4, 0.01), 0.0),
-        Sfx::Launch => {
-            for f in [523.0, 659.0, 784.0] {
-                mix(&mut o, &tone(0.7, f * 0.5, f, 0.3, 0.08), 0.0);
-            }
-            mix(&mut o, &tone(0.5, 1047.0, 1047.0, 0.25, 0.01), 0.25);
-        }
-        Sfx::Done => {
-            mix(&mut o, &tone(0.14, 784.0, 784.0, 0.45, 0.004), 0.0);
-            mix(&mut o, &tone(0.3, 1047.0, 1047.0, 0.45, 0.004), 0.1);
-        }
-        Sfx::Error => {
-            mix(&mut o, &tone(0.1, 200.0, 200.0, 0.6, 0.004), 0.0);
-            mix(&mut o, &tone(0.14, 200.0, 180.0, 0.6, 0.004), 0.14);
-        }
-        Sfx::Startup => {
-            for (f, at) in [(261.6, 0.0), (329.6, 0.12), (392.0, 0.24), (523.3, 0.4)] {
-                mix(&mut o, &tone(1.4, f, f, 0.28, 0.12), at);
-            }
+        for i in 0..v.len() {
+            v[i] += (buf[i] - dry[i]) * wet * 0.3;
         }
     }
-    for x in &mut o {
-        *x = x.clamp(-1.0, 1.0);
+    lowpass(v, 6500.0);
+}
+
+fn fin(mut o: Vec<f32>, peak: f32) -> Vec<f32> {
+    let m = o.iter().fold(0.0f32, |a, x| a.max(x.abs())).max(1e-6);
+    let g = peak / m;
+    let n = o.len();
+    let f = ((0.015 * SR) as usize).max(1);
+    for (i, x) in o.iter_mut().enumerate() {
+        *x *= g;
+        if i + f > n {
+            *x *= (n - i) as f32 / f as f32;
+        }
     }
     o
+}
+
+fn synth(s: Sfx) -> Vec<f32> {
+    let mut o: Vec<f32> = vec![];
+    // (reverb wet, reverb tail seconds, peak level)
+    let (wet, tail, peak) = match s {
+        Sfx::Move => {
+            mix(&mut o, &note(0.10, 784.0, 740.0, 1.0, 0.004, 34.0), 0.0);
+            mix(&mut o, &puff(0.025, 3000.0, 0.15, 7), 0.0);
+            (0.2, 0.12, 0.20)
+        }
+        Sfx::Bump => {
+            mix(&mut o, &note(0.12, 196.0, 170.0, 1.0, 0.006, 26.0), 0.0);
+            (0.1, 0.1, 0.30)
+        }
+        Sfx::Tick => {
+            mix(&mut o, &note(0.04, 1568.0, 1500.0, 1.0, 0.002, 80.0), 0.0);
+            (0.1, 0.05, 0.12)
+        }
+        Sfx::Tab => {
+            mix(&mut o, &note(0.12, 659.0, 659.0, 1.0, 0.004, 22.0), 0.0);
+            mix(&mut o, &note(0.16, 880.0, 880.0, 1.0, 0.004, 20.0), 0.045);
+            (0.3, 0.2, 0.24)
+        }
+        Sfx::Select => {
+            mix(&mut o, &note(0.28, 659.0, 659.0, 1.0, 0.004, 11.0), 0.0);
+            mix(&mut o, &note(0.40, 988.0, 988.0, 1.0, 0.004, 9.0), 0.07);
+            (0.45, 0.35, 0.32)
+        }
+        Sfx::Back => {
+            mix(&mut o, &note(0.20, 784.0, 784.0, 1.0, 0.004, 14.0), 0.0);
+            mix(&mut o, &note(0.28, 587.0, 587.0, 1.0, 0.004, 12.0), 0.07);
+            (0.35, 0.3, 0.26)
+        }
+        Sfx::Fav => {
+            for (f, at) in [(1047.0, 0.0), (1319.0, 0.07), (1568.0, 0.14), (2093.0, 0.21)] {
+                mix(&mut o, &note(0.35, f, f, 1.0, 0.004, 10.0), at);
+            }
+            (0.5, 0.4, 0.26)
+        }
+        Sfx::Unfav => {
+            for (f, at) in [(1319.0, 0.0), (1047.0, 0.07)] {
+                mix(&mut o, &note(0.25, f, f, 1.0, 0.004, 14.0), at);
+            }
+            (0.3, 0.25, 0.22)
+        }
+        Sfx::Open => {
+            mix(&mut o, &puff(0.22, 1800.0, 0.25, 11), 0.0);
+            mix(&mut o, &note(0.30, 440.0, 660.0, 1.0, 0.06, 8.0), 0.0);
+            mix(&mut o, &note(0.40, 988.0, 988.0, 0.7, 0.01, 9.0), 0.12);
+            (0.4, 0.3, 0.30)
+        }
+        Sfx::Close => {
+            mix(&mut o, &note(0.22, 660.0, 440.0, 1.0, 0.01, 14.0), 0.0);
+            (0.35, 0.25, 0.24)
+        }
+        Sfx::Launch => {
+            for f in [130.8, 196.0, 261.6, 392.0, 523.3] {
+                mix(&mut o, &note(1.6, f, f, 0.5, 0.35, 2.2), 0.0);
+            }
+            mix(&mut o, &note(1.0, 1568.0, 1568.0, 0.2, 0.2, 3.0), 0.35);
+            mix(&mut o, &puff(1.2, 2200.0, 0.08, 5), 0.0);
+            lowpass(&mut o, 3500.0);
+            (0.7, 0.8, 0.40)
+        }
+        Sfx::Done => {
+            mix(&mut o, &note(0.35, 784.0, 784.0, 1.0, 0.004, 9.0), 0.0);
+            mix(&mut o, &note(0.60, 1047.0, 1047.0, 1.0, 0.004, 6.0), 0.12);
+            (0.5, 0.5, 0.30)
+        }
+        Sfx::Error => {
+            mix(&mut o, &note(0.18, 165.0, 140.0, 1.0, 0.006, 20.0), 0.0);
+            mix(&mut o, &note(0.22, 150.0, 125.0, 1.0, 0.006, 18.0), 0.16);
+            lowpass(&mut o, 900.0);
+            (0.15, 0.15, 0.30)
+        }
+        Sfx::Startup => {
+            for (f, at) in [(130.8, 0.0), (196.0, 0.1), (261.6, 0.2), (329.6, 0.35), (392.0, 0.5)] {
+                mix(&mut o, &note(2.4, f, f, 0.5, 0.5, 1.5), at);
+            }
+            for (f, at) in [(1047.0, 0.9), (1568.0, 1.1), (2093.0, 1.3)] {
+                mix(&mut o, &note(1.2, f, f, 0.18, 0.15, 3.0), at);
+            }
+            mix(&mut o, &puff(1.5, 1500.0, 0.05, 3), 0.1);
+            lowpass(&mut o, 3500.0);
+            (0.8, 1.0, 0.42)
+        }
+    };
+    reverb(&mut o, wet, tail);
+    fin(o, peak)
 }
 
 /// Audio thread: opens the output device on demand, closes it after 20 s idle.
@@ -551,16 +666,22 @@ fn ci(img: &image::RgbaImage) -> ColorImage {
     ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw())
 }
 fn decode(k: usize, p: &Path) -> Option<Msg> {
-    use image::imageops::FilterType::Triangle;
+    use image::imageops::FilterType::{CatmullRom, Triangle};
     let img = image::ImageReader::open(p).ok()?.with_guessed_format().ok()?.decode().ok()?;
     Some(match k {
-        0 => Msg::Poster(ci(&img.resize_to_fill(400, 600, Triangle).to_rgba8())),
+        0 => Msg::Poster(
+            ci(&img.resize_to_fill(560, 840, CatmullRom).to_rgba8()),
+            ci(&img.resize_to_fill(260, 390, CatmullRom).to_rgba8()),
+        ),
         1 => {
-            let big = img.resize(1280, 1280, Triangle).to_rgba8();
-            let small = image::imageops::blur(&img.resize(96, 96, Triangle).to_rgba8(), 2.5);
-            Msg::Hero(ci(&big), ci(&small))
+            let small = image::imageops::blur(&img.resize(256, 256, Triangle).to_rgba8(), 3.0);
+            let hero = if img.width() > 1920 { img.resize(1920, 1920, CatmullRom) } else { img };
+            Msg::Hero(ci(&hero.to_rgba8()), ci(&small))
         }
-        _ => Msg::Logo(ci(&img.resize(600, 240, Triangle).to_rgba8())),
+        _ => {
+            let lg = if img.width() > 600 || img.height() > 240 { img.resize(600, 240, CatmullRom) } else { img };
+            Msg::Logo(ci(&lg.to_rgba8()))
+        }
     })
 }
 
@@ -979,11 +1100,25 @@ fn uv_full() -> Rect {
     Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0))
 }
 
+fn fan(p: &Painter, pts: &[Pos2], f: impl Fn(Pos2) -> Color32) {
+    let mut m = Mesh::default();
+    for &pos in pts {
+        m.colored_vertex(pos, f(pos));
+    }
+    for i in 1..pts.len() - 1 {
+        m.add_triangle(0, i as u32, i as u32 + 1);
+    }
+    p.add(Shape::mesh(m));
+}
+
+/// Frosted glass: blurred backdrop (sampled at the panel's own position), frost gradient, light-catching edge.
 fn glass(p: &Painter, rect: Rect, rad: f32, bl: Option<(&TextureHandle, Rect)>, full: Rect, k: f32) {
     let pts = rounded_pts(rect, rad);
-    p.rect_filled(rect.expand(2.0).translate(vec2(0.0, 6.0)), rad + 4.0, Color32::from_black_alpha((70.0 * k) as u8));
-    if let Some((tex, uv)) = bl {
-        round_img(
+    for (e, dy, a) in [(10.0_f32, 14.0_f32, 14.0_f32), (5.0, 8.0, 20.0), (1.0, 3.0, 30.0)] {
+        p.rect_filled(rect.expand(e).translate(vec2(0.0, dy)), rad + e, Color32::from_black_alpha((a * k) as u8));
+    }
+    match bl {
+        Some((tex, uv)) => round_img(
             p,
             &pts,
             tex.id(),
@@ -993,16 +1128,37 @@ fn glass(p: &Painter, rect: Rect, rad: f32, bl: Option<(&TextureHandle, Rect)>, 
                     uv.min.y + (pt.y - full.min.y) / full.height() * uv.height(),
                 )
             },
-            Color32::from_gray(150).gamma_multiply(k),
-        );
-    } else {
-        p.add(Shape::convex_polygon(pts.clone(), Color32::from_black_alpha((120.0 * k) as u8), Stroke::NONE));
+            Color32::from_gray(86).gamma_multiply(k),
+        ),
+        None => {
+            p.add(Shape::convex_polygon(pts.clone(), Color32::from_rgba_unmultiplied(20, 26, 46, (230.0 * k) as u8), Stroke::NONE));
+        }
     }
-    p.add(Shape::convex_polygon(pts, Color32::from_white_alpha((34.0 * k) as u8), Stroke::new(1.0, Color32::from_white_alpha((80.0 * k) as u8))));
-    p.line_segment(
-        [rect.left_top() + vec2(rad, 1.0), rect.right_top() + vec2(-rad, 1.0)],
-        Stroke::new(1.0, Color32::from_white_alpha((120.0 * k) as u8)),
-    );
+    fan(p, &pts, |_| Color32::from_black_alpha((48.0 * k) as u8));
+    let (y0, h) = (rect.top(), rect.height().max(1.0));
+    fan(p, &pts, |pt| {
+        let t = ((pt.y - y0) / h).clamp(0.0, 1.0);
+        Color32::from_white_alpha(((30.0 - 18.0 * t) * k) as u8)
+    });
+    let n = pts.len();
+    for i in 0..n {
+        let (a, b) = (pts[i], pts[(i + 1) % n]);
+        let m = a.lerp(b, 0.5);
+        let t = ((m.x - rect.min.x) / rect.width().max(1.0) + (m.y - rect.min.y) / h) * 0.5;
+        let al = ((120.0 - 90.0 * t.clamp(0.0, 1.0)) * k) as u8;
+        p.line_segment([a, b], Stroke::new(1.0, Color32::from_white_alpha(al)));
+    }
+}
+
+fn keycap(p: &Painter, x: f32, cy: f32, key: &str, label: &str) -> f32 {
+    let kg = p.layout_no_wrap(key.to_string(), FontId::proportional(10.5), Color32::from_white_alpha(225));
+    let kw = (kg.size().x + 16.0).max(24.0);
+    let kr = Rect::from_min_size(pos2(x, cy - 10.0), vec2(kw, 20.0));
+    p.rect_filled(kr, 10.0, Color32::from_white_alpha(24));
+    p.rect_stroke(kr, 10.0, Stroke::new(1.0, Color32::from_white_alpha(70)));
+    p.text(kr.center(), Align2::CENTER_CENTER, key, FontId::proportional(10.5), Color32::from_white_alpha(225));
+    let lr = p.text(pos2(kr.right() + 8.0, cy), Align2::LEFT_CENTER, label, FontId::proportional(13.0), Color32::from_white_alpha(150));
+    lr.right() + 24.0
 }
 
 fn grad(p: &Painter, r: Rect, c0: Color32, c1: Color32, horizontal: bool) {
@@ -1025,21 +1181,23 @@ fn grad(p: &Painter, r: Rect, c0: Color32, c1: Color32, horizontal: bool) {
 
 fn shade(p: &Painter, f: Rect) {
     let t = Color32::TRANSPARENT;
-    grad(p, Rect::from_min_size(f.min, vec2(f.width() * 0.65, f.height())), Color32::from_black_alpha(200), t, true);
-    grad(p, Rect::from_min_max(pos2(f.left(), f.top() + f.height() * 0.45), f.max), t, Color32::from_black_alpha(225), false);
-    grad(p, Rect::from_min_size(f.min, vec2(f.width(), 120.0)), Color32::from_black_alpha(140), t, false);
+    p.rect_filled(f, 0.0, Color32::from_black_alpha(78));
+    grad(p, Rect::from_min_size(f.min, vec2(f.width() * 0.62, f.height())), Color32::from_black_alpha(190), t, true);
+    grad(p, Rect::from_min_max(pos2(f.left(), f.top() + f.height() * 0.38), f.max), t, Color32::from_black_alpha(235), false);
+    grad(p, Rect::from_min_size(f.min, vec2(f.width(), 130.0)), Color32::from_black_alpha(150), t, false);
 }
 
 fn draw_cover(p: &Painter, tex: &TextureHandle, full: Rect, a: f32) {
     p.image(tex.id(), full, cover_uv(tex.size_vec2(), full), Color32::from_white_alpha((a * 255.0) as u8));
 }
 
-/// Static background (no per-frame animation = near-zero idle cost).
+/// Static background (no per-frame animation = near-zero idle cost). Soft glow, no hard shapes.
 fn background(p: &Painter, r: Rect) {
-    grad(p, r, Color32::from_rgb(8, 12, 28), Color32::from_rgb(22, 38, 78), false);
-    for (k, (rad, a)) in [(300.0, 6u8), (200.0, 8), (120.0, 10)].iter().enumerate() {
-        let c = pos2(r.left() + r.width() * (0.35 + 0.18 * k as f32), r.top() + r.height() * 0.42);
-        p.circle_filled(c, *rad, Color32::from_rgba_unmultiplied(70, 120, 255, *a));
+    grad(p, r, Color32::from_rgb(7, 10, 24), Color32::from_rgb(18, 30, 66), false);
+    let c = pos2(r.left() + r.width() * 0.62, r.top() + r.height() * 0.38);
+    for i in 0..14 {
+        let t = i as f32 / 13.0;
+        p.circle_filled(c, r.height() * (0.75 - 0.55 * t), Color32::from_rgba_unmultiplied(70, 120, 255, 3));
     }
 }
 
@@ -1050,7 +1208,7 @@ fn splash(p: &Painter, r: Rect, t: f64) {
     let pulse = 70.0 + 6.0 * (t * 4.0).sin() as f32;
     p.circle_stroke(c - vec2(0.0, 40.0), pulse, Stroke::new(3.0, Color32::from_white_alpha((200.0 * a) as u8)));
     p.circle_stroke(c - vec2(0.0, 40.0), pulse * 0.7, Stroke::new(2.0, Color32::from_rgba_unmultiplied(90, 150, 255, (220.0 * a) as u8)));
-    p.text(c + vec2(0.0, 90.0), Align2::CENTER_CENTER, "L A U N C H E R", FontId::proportional(34.0), Color32::from_white_alpha((255.0 * a) as u8));
+    p.text(c + vec2(0.0, 90.0), Align2::CENTER_CENTER, "L A U N C H E R", fb(30.0), Color32::from_white_alpha((255.0 * a) as u8));
     let w = 220.0;
     let bar = Rect::from_center_size(c + vec2(0.0, 135.0), vec2(w, 4.0));
     p.rect_filled(bar, 2.0, Color32::from_white_alpha((40.0 * a) as u8));
@@ -1110,6 +1268,16 @@ struct App {
 
 impl App {
     fn new(dir: PathBuf, cc: &eframe::CreationContext<'_>) -> Self {
+        let mut fonts = FontDefinitions::default();
+        fonts.font_data.insert("hg".into(), FontData::from_static(include_bytes!("../assets/HankenGrotesk-Medium.otf")));
+        fonts.font_data.insert("hgb".into(), FontData::from_static(include_bytes!("../assets/HankenGrotesk-SemiBold.otf")));
+        if let Some(f) = fonts.families.get_mut(&FontFamily::Proportional) {
+            f.insert(0, "hg".into());
+        }
+        let mut bold = vec!["hgb".to_string()];
+        bold.extend(fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
+        fonts.families.insert(FontFamily::Name("bold".into()), bold);
+        cc.egui_ctx.set_fonts(fonts);
         let cache = dir.join(".cache");
         let _ = fs::create_dir_all(&cache);
         let prefs_path = cache.join("prefs.json");
@@ -1267,6 +1435,20 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _: &mut eframe::Frame) {
+        // responsive: scale the whole UI so the layout always spans ~1100x720 points (windowed, maximized or fullscreen)
+        {
+            let ppp = ctx.pixels_per_point();
+            let sr = ctx.screen_rect();
+            let (pw, ph) = (sr.width() * ppp, sr.height() * ppp);
+            if pw > 300.0 && ph > 200.0 {
+                let nat = ctx.native_pixels_per_point().unwrap_or(1.0).max(0.1);
+                let z = ((ph / 720.0).min(pw / 1100.0) / nat).clamp(0.5, 4.0);
+                if (z - ctx.zoom_factor()).abs() > 0.02 {
+                    ctx.set_zoom_factor(z);
+                    ctx.request_repaint();
+                }
+            }
+        }
         let t_abs = ctx.input(|i| i.time);
         let start = *self.start.get_or_insert(t_abs);
         let t = t_abs - start;
@@ -1278,7 +1460,10 @@ impl eframe::App for App {
             let a = self.assets.entry(n.clone()).or_default();
             let lt = |s: &str, c: ColorImage| ctx.load_texture(format!("{n}-{s}"), c, TextureOptions::LINEAR);
             match m {
-                Msg::Poster(c) => a.poster = Some(lt("p", c)),
+                Msg::Poster(c, sm) => {
+                    a.poster = Some(lt("p", c));
+                    a.poster_s = Some(lt("ps", sm));
+                }
                 Msg::Hero(c, b) => {
                     a.hero = Some(lt("h", c));
                     a.blur = Some(lt("b", b));
@@ -1480,8 +1665,8 @@ impl eframe::App for App {
             // asset requests + free textures far from selection
             if !self.view.is_empty() {
                 let n = self.view.len();
-                let lo = self.sel.saturating_sub(2);
-                let hi = (self.sel + 6).min(n - 1);
+                let lo = self.sel.saturating_sub(1);
+                let hi = (self.sel + 5).min(n - 1);
                 for &gi in &self.view[lo..=hi] {
                     let g = &self.games[gi];
                     if self.requested.insert(g.name.clone()) {
@@ -1494,13 +1679,14 @@ impl eframe::App for App {
                 }
                 if self.sel != self.last_sel {
                     self.last_sel = self.sel;
-                    let klo = self.sel.saturating_sub(4);
-                    let khi = (self.sel + 8).min(n - 1);
+                    let klo = self.sel.saturating_sub(3);
+                    let khi = (self.sel + 7).min(n - 1);
                     let keep: HashSet<&String> = self.view[klo..=khi].iter().map(|&i| &self.games[i].name).collect();
                     let drop: Vec<String> = self.assets.keys().filter(|k| !keep.contains(k)).cloned().collect();
                     for k in drop {
                         if let Some(a) = self.assets.get_mut(&k) {
                             a.poster = None;
+                            a.poster_s = None;
                             a.hero = None;
                             a.blur = None;
                             a.logo = None;
@@ -1540,44 +1726,48 @@ impl eframe::App for App {
             let blur_uv = blur_tex.as_ref().map(|b| cover_uv(b.size_vec2(), full));
             let bl = blur_tex.as_ref().zip(blur_uv);
 
-            // ---- top bar: tabs ----
-            let mut tx = full.left() + 70.0;
+            let left = full.left() + 72.0;
+            let right = full.right() - 72.0;
+
+            // ---- top bar: pill tabs ----
+            let mut tx = left;
             for (i, tn) in ["All", "Favorites", "Recent"].iter().enumerate() {
-                let col = if i == self.tab { Color32::WHITE } else { Color32::from_white_alpha(130) };
-                let g = p.layout_no_wrap(tn.to_string(), FontId::proportional(22.0), col);
-                let sz = g.size();
-                let r = Rect::from_min_size(pos2(tx, full.top() + 30.0), sz);
-                if i == self.tab {
-                    p.rect_filled(Rect::from_min_size(pos2(tx, r.bottom() + 4.0), vec2(sz.x, 3.0)), 2.0, Color32::WHITE);
+                let on = i == self.tab;
+                let col = if on { Color32::WHITE } else { Color32::from_white_alpha(150) };
+                let g = p.layout_no_wrap(tn.to_string(), if on { fb(17.0) } else { FontId::proportional(17.0) }, col);
+                let pill = Rect::from_min_size(pos2(tx, full.top() + 26.0), vec2(g.size().x + 36.0, 38.0));
+                if on {
+                    glass(&p, pill, 19.0, bl, full, 1.0);
                 }
-                if ui.interact(r, Id::new(("tab", i)), sense).clicked() {
+                let gp = pill.center() - g.size() / 2.0;
+                p.galley(gp, g, col);
+                if ui.interact(pill, Id::new(("tab", i)), sense).clicked() {
                     self.tab = i;
                     self.dirty = true;
                     self.play(Sfx::Tab);
                     ctx.request_repaint();
                 }
-                p.galley(r.min, g, col);
-                tx += sz.x + 28.0;
+                tx += pill.width() + 6.0;
             }
             // system monitor + clock
+            let cr = p.text(
+                pos2(right, full.top() + 45.0),
+                Align2::RIGHT_CENTER,
+                chrono::Local::now().format("%H:%M").to_string(),
+                fb(24.0),
+                Color32::WHITE,
+            );
             let sys_txt = format!(
                 "CPU {:.0}%    RAM {:.1}/{:.0} GB",
                 self.sys.global_cpu_usage(),
                 self.sys.used_memory() as f64 / GB,
                 self.sys.total_memory() as f64 / GB
             );
-            p.text(full.right_top() + vec2(-150.0, 44.0), Align2::RIGHT_CENTER, sys_txt, FontId::proportional(15.0), Color32::from_white_alpha(170));
-            p.text(
-                full.right_top() + vec2(-70.0, 44.0),
-                Align2::RIGHT_CENTER,
-                chrono::Local::now().format("%H:%M").to_string(),
-                FontId::proportional(22.0),
-                Color32::from_white_alpha(220),
-            );
+            p.text(pos2(cr.left() - 28.0, full.top() + 45.0), Align2::RIGHT_CENTER, sys_txt, FontId::proportional(14.0), Color32::from_white_alpha(160));
             // search pill
             if self.searching || !self.search.is_empty() {
-                let r = Rect::from_center_size(pos2(full.center().x, full.top() + 44.0), vec2(300.0, 36.0));
-                glass(&p, r, 18.0, bl, full, 1.0);
+                let r = Rect::from_center_size(pos2(full.center().x, full.top() + 45.0), vec2(320.0, 38.0));
+                glass(&p, r, 19.0, bl, full, 1.0);
                 let cursor = if self.searching { "_" } else { "" };
                 p.text(r.center(), Align2::CENTER_CENTER, format!("Search: {}{}", self.search, cursor), FontId::proportional(16.0), Color32::WHITE);
             }
@@ -1586,8 +1776,8 @@ impl eframe::App for App {
                 let s = self.mon.lock().unwrap().clone();
                 let fps = s.fps.map_or("FPS n/a".to_string(), |f| format!("{f:.0} FPS"));
                 let txt = format!("{}   {}   CPU {:.0}%   RAM {:.1} GB", trunc(&s.name, 18), fps, s.game_cpu, s.game_ram as f64 / GB);
-                let r = Rect::from_min_size(pos2(full.right() - 70.0 - 420.0, full.top() + 78.0), vec2(420.0, 34.0));
-                glass(&p, r, 17.0, bl, full, 1.0);
+                let r = Rect::from_min_size(pos2(right - 440.0, full.top() + 80.0), vec2(440.0, 36.0));
+                glass(&p, r, 18.0, bl, full, 1.0);
                 p.circle_filled(r.left_center() + vec2(18.0, 0.0), 5.0, Color32::from_rgb(90, 220, 120));
                 p.text(r.left_center() + vec2(32.0, 0.0), Align2::LEFT_CENTER, txt, FontId::proportional(15.0), Color32::WHITE);
             }
@@ -1609,17 +1799,18 @@ impl eframe::App for App {
             let mut open_props = false;
 
             // ---- poster carousel ----
-            let (w0, h0, gap) = (104.0_f32, 156.0_f32, 16.0_f32);
-            let grow = w0 * 0.5;
-            let left = full.left() + 70.0;
+            let (w0, h0, gap) = (108.0_f32, 162.0_f32, 18.0_f32);
+            let big = 1.4_f32;
+            let grow = w0 * (big - 1.0);
             let top = full.top() + 108.0;
             for i in 0..n {
                 let d = i as f32 - self.pos;
                 let k = (1.0 - d.abs()).clamp(0.0, 1.0);
-                let s = 1.0 + 0.5 * k;
+                let ke = k * k * (3.0 - 2.0 * k);
+                let s = 1.0 + (big - 1.0) * ke;
                 let (w, h) = (w0 * s, h0 * s);
                 let x = left + d * (w0 + gap) + grow * d.clamp(0.0, 1.0);
-                let y = top + (h0 * 1.5 - h) / 2.0;
+                let y = top + (h0 * big - h) / 2.0;
                 let rect = Rect::from_min_size(pos2(x, y), vec2(w, h));
                 if rect.right() < full.left() || rect.left() > full.right() {
                     continue;
@@ -1628,32 +1819,44 @@ impl eframe::App for App {
                 let name = self.games[gi].name.clone();
                 let zip = self.games[gi].kind == Kind::Zip;
                 let fav = self.prefs.fav.contains(&name);
-                let poster = self.assets.get(&name).and_then(|a| a.poster.clone());
-                let pts = rounded_pts(rect, 12.0);
-                if k > 0.0 {
-                    p.rect_filled(rect.expand(8.0 * k).translate(vec2(0.0, 8.0 * k)), 18.0, Color32::from_black_alpha((100.0 * k) as u8));
-                }
-                let dim = (170.0 + 85.0 * k) as u8;
-                match &poster {
-                    Some(tx) => round_img(&p, &pts, tx.id(), |pt| pos2((pt.x - rect.min.x) / w, (pt.y - rect.min.y) / h), Color32::from_gray(dim)),
-                    None => {
-                        p.add(Shape::convex_polygon(pts.clone(), tint(&name).gamma_multiply(0.6 + 0.4 * k), Stroke::NONE));
-                        let ch = name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
-                        p.text(rect.center(), Align2::CENTER_CENTER, ch, FontId::proportional(w * 0.4), Color32::from_white_alpha(200));
+                let (pl, ps) = {
+                    let a = self.assets.get(&name);
+                    (a.and_then(|a| a.poster.clone()), a.and_then(|a| a.poster_s.clone()))
+                };
+                let tex = if ke > 0.3 { pl.or(ps) } else { ps.or(pl) };
+                let rad = 10.0 + 4.0 * ke;
+                let pts = rounded_pts(rect, rad);
+                if ke > 0.0 {
+                    for (e, dy, a) in [(12.0_f32, 14.0_f32, 26.0_f32), (6.0, 8.0, 38.0)] {
+                        p.rect_filled(rect.expand(e * ke).translate(vec2(0.0, dy * ke)), rad + e * ke, Color32::from_black_alpha((a * ke) as u8));
                     }
                 }
+                let dim = (150.0 + 105.0 * ke) as u8;
+                match &tex {
+                    Some(tx) => round_img(&p, &pts, tx.id(), |pt| pos2((pt.x - rect.min.x) / w, (pt.y - rect.min.y) / h), Color32::from_gray(dim)),
+                    None => {
+                        let c0 = tint(&name).gamma_multiply(0.7 + 0.3 * ke);
+                        let c1 = c0.gamma_multiply(0.4);
+                        let (ry, rh) = (rect.top(), h);
+                        fan(&p, &pts, |pt| c0.lerp_to_gamma(c1, ((pt.y - ry) / rh).clamp(0.0, 1.0)));
+                        let ch = name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+                        p.text(rect.center(), Align2::CENTER_CENTER, ch, fb(w * 0.42), Color32::from_white_alpha(200));
+                    }
+                }
+                p.add(Shape::closed_line(pts.clone(), Stroke::new(1.0, Color32::from_white_alpha(30))));
                 if zip {
-                    let b = Rect::from_min_size(rect.left_top() + vec2(8.0, 8.0), vec2(36.0, 18.0));
-                    p.rect_filled(b, 6.0, Color32::from_black_alpha(170));
-                    p.text(b.center(), Align2::CENTER_CENTER, "ZIP", FontId::proportional(11.0), Color32::WHITE);
+                    let b = Rect::from_min_size(rect.left_top() + vec2(8.0, 8.0), vec2(34.0, 18.0));
+                    p.rect_filled(b, 9.0, Color32::from_black_alpha(170));
+                    p.text(b.center(), Align2::CENTER_CENTER, "ZIP", fb(10.0), Color32::WHITE);
                 }
                 if fav {
-                    let b = Rect::from_min_size(rect.right_top() + vec2(-44.0, 8.0), vec2(36.0, 18.0));
-                    p.rect_filled(b, 6.0, Color32::from_rgb(230, 170, 40));
-                    p.text(b.center(), Align2::CENTER_CENTER, "FAV", FontId::proportional(11.0), Color32::BLACK);
+                    let c = rect.right_top() + vec2(-15.0, 15.0);
+                    p.circle_filled(c, 6.0, Color32::from_rgb(255, 196, 60));
+                    p.circle_stroke(c, 6.0, Stroke::new(1.0, Color32::from_black_alpha(90)));
                 }
-                if k > 0.0 {
-                    p.add(Shape::closed_line(pts, Stroke::new(3.0, Color32::from_white_alpha((235.0 * k) as u8))));
+                if ke > 0.02 {
+                    let ring = rect.expand(5.0 * ke);
+                    p.add(Shape::closed_line(rounded_pts(ring, rad + 5.0 * ke), Stroke::new(2.5, ACC.gamma_multiply(ke))));
                 }
                 if ui.interact(rect, Id::new(("card", i)), sense).clicked() {
                     if i == sel {
@@ -1680,17 +1883,17 @@ impl eframe::App for App {
                     a.and_then(|a| a.meta.clone()).unwrap_or_default(),
                     a.and_then(|a| a.size),
                     a.and_then(|a| a.logo.clone()),
-                    a.and_then(|a| a.poster.clone()),
+                    a.and_then(|a| a.poster.clone().or(a.poster_s.clone())),
                 )
             };
             let st = self.stats.lock().unwrap().get(&name).cloned().unwrap_or(Value::Null);
             let (launches, secs, last) = (st["n"].as_u64().unwrap_or(0), st["secs"].as_u64().unwrap_or(0), st["last"].as_u64().unwrap_or(0));
             let size_s = size.map_or("Calculating…".to_string(), fmt_size);
 
-            let strip = Rect::from_min_size(pos2(left, full.bottom() - 98.0), vec2(full.width() - 140.0, 62.0));
-            let btn_y = strip.top() - 66.0;
+            let strip = Rect::from_min_size(pos2(left, full.bottom() - 104.0), vec2(right - left, 62.0));
+            let btn_y = strip.top() - 64.0;
             let desc: String = meta.desc.chars().take(230).collect();
-            let gal = p.layout(desc, FontId::proportional(17.0), Color32::from_white_alpha(215), 460.0);
+            let gal = p.layout(desc, FontId::proportional(16.0), Color32::from_white_alpha(210), 520.0);
             let desc_h = if meta.desc.is_empty() { 0.0 } else { gal.size().y };
             let desc_y = btn_y - 16.0 - desc_h;
             if !meta.desc.is_empty() {
@@ -1700,12 +1903,12 @@ impl eframe::App for App {
             match &logo {
                 Some(lg) => {
                     let ts = lg.size_vec2();
-                    let sc = (400.0 / ts.x).min(110.0 / ts.y).min(1.0);
+                    let sc = (420.0 / ts.x).min(110.0 / ts.y).min(1.0);
                     let sz = ts * sc;
                     p.image(lg.id(), Rect::from_min_size(pos2(left, tb - sz.y), sz), uv_full(), Color32::WHITE);
                 }
                 None => {
-                    p.text(pos2(left, tb), Align2::LEFT_BOTTOM, &name, FontId::proportional(44.0), Color32::WHITE);
+                    p.text(pos2(left, tb), Align2::LEFT_BOTTOM, trunc(&name, 38), fb(46.0), Color32::WHITE);
                 }
             }
 
@@ -1717,27 +1920,32 @@ impl eframe::App for App {
                 (Kind::Folder, true) => ("Play", true),
                 (Kind::Folder, false) => ("Unavailable", false),
             };
-            let play = Rect::from_min_size(pos2(left, btn_y), vec2(176.0, 48.0));
+            let play = Rect::from_min_size(pos2(left, btn_y), vec2(168.0, 46.0));
             let r1 = ui.interact(play, Id::new("play"), sense);
             let base = if enabled { if r1.hovered() { 255 } else { 238 } } else { 120 };
-            p.add(Shape::convex_polygon(rounded_pts(play, 24.0), Color32::from_gray(base), Stroke::NONE));
-            p.text(play.center(), Align2::CENTER_CENTER, label, FontId::proportional(20.0), Color32::from_gray(20));
+            if enabled {
+                p.rect_filled(play.expand(3.0).translate(vec2(0.0, 5.0)), 26.0, Color32::from_black_alpha(60));
+            }
+            p.add(Shape::convex_polygon(rounded_pts(play, 23.0), Color32::from_gray(base), Stroke::NONE));
+            p.text(play.center(), Align2::CENTER_CENTER, label, fb(18.0), Color32::from_gray(20));
             if r1.clicked() {
                 activate = true;
             }
-            let more = Rect::from_min_size(pos2(left + 192.0, btn_y), vec2(48.0, 48.0));
+            let more = Rect::from_min_size(pos2(left + 182.0, btn_y), vec2(46.0, 46.0));
             let r2 = ui.interact(more, Id::new("more"), sense);
-            glass(&p, more, 24.0, bl, full, 1.0);
+            glass(&p, more, 23.0, bl, full, 1.0);
             if r2.hovered() {
-                p.add(Shape::convex_polygon(rounded_pts(more, 24.0), Color32::from_white_alpha(40), Stroke::NONE));
+                p.add(Shape::convex_polygon(rounded_pts(more, 23.0), Color32::from_white_alpha(40), Stroke::NONE));
             }
-            p.text(more.center(), Align2::CENTER_CENTER, "...", FontId::proportional(22.0), Color32::WHITE);
+            for dx in [-8.0_f32, 0.0, 8.0] {
+                p.circle_filled(more.center() + vec2(dx, 0.0), 2.2, Color32::WHITE);
+            }
             if r2.clicked() {
                 open_props = true;
             }
 
             // glass info strip
-            glass(&p, strip, 16.0, bl, full, 1.0);
+            glass(&p, strip, 18.0, bl, full, 1.0);
             let cols = [
                 ("Developer", trunc(&meta.dev, 18)),
                 ("Genre", trunc(&meta.genres, 22)),
@@ -1746,31 +1954,36 @@ impl eframe::App for App {
                 ("Last played", fmt_last(last)),
                 ("Play time", fmt_time(secs)),
             ];
-            let cw = (strip.width() - 32.0) / cols.len() as f32;
+            let cw = (strip.width() - 40.0) / cols.len() as f32;
             for (i, (lb, v)) in cols.iter().enumerate() {
-                let x = strip.left() + 16.0 + cw * i as f32;
+                let x = strip.left() + 22.0 + cw * i as f32;
+                if i > 0 {
+                    p.line_segment(
+                        [pos2(x - 14.0, strip.top() + 14.0), pos2(x - 14.0, strip.bottom() - 14.0)],
+                        Stroke::new(1.0, Color32::from_white_alpha(28)),
+                    );
+                }
                 p.text(pos2(x, strip.top() + 12.0), Align2::LEFT_TOP, *lb, FontId::proportional(12.0), Color32::from_white_alpha(150));
-                p.text(pos2(x, strip.top() + 30.0), Align2::LEFT_TOP, v, FontId::proportional(17.0), Color32::WHITE);
+                p.text(pos2(x, strip.top() + 30.0), Align2::LEFT_TOP, v, fb(16.0), Color32::WHITE);
             }
-            p.text(
-                pos2(full.right() - 70.0, full.bottom() - 16.0),
-                Align2::RIGHT_CENTER,
-                "Enter/A Play   I/X Details   F/Y Favorite   Tab/LB RB Tabs   / Search   M Sound",
-                FontId::proportional(12.0),
-                Color32::from_white_alpha(110),
-            );
+            // button hints
+            let hy = full.bottom() - 22.0;
+            let mut hx = left;
+            for (k, l) in [("A / Enter", "Play"), ("X / I", "Details"), ("Y / F", "Favorite"), ("LB RB / Tab", "Tabs"), ("/", "Search"), ("M", "Sound")] {
+                hx = keycap(&p, hx, hy, k, l);
+            }
 
             // progress + toast
             if self.busy {
                 let pr = self.job.lock().unwrap().progress;
-                let bar = Rect::from_min_size(pos2(left, full.bottom() - 30.0), vec2(full.width() - 140.0, 5.0));
-                p.rect_filled(bar, 3.0, Color32::from_white_alpha(40));
-                p.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * pr, 5.0)), 3.0, Color32::from_rgb(90, 150, 255));
+                let bar = Rect::from_min_size(pos2(full.left(), full.bottom() - 4.0), vec2(full.width(), 4.0));
+                p.rect_filled(bar, 0.0, Color32::from_white_alpha(40));
+                p.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * pr, 4.0)), 0.0, ACC);
                 self.anim = true;
             }
             if let Some((m, at)) = &self.msg {
                 if t - at < 3.0 {
-                    p.text(pos2(full.right() - 70.0, btn_y + 24.0), Align2::RIGHT_CENTER, m, FontId::proportional(18.0), Color32::from_white_alpha(220));
+                    p.text(pos2(right, btn_y + 23.0), Align2::RIGHT_CENTER, m, fb(17.0), Color32::from_white_alpha(225));
                     ctx.request_repaint_after(Duration::from_millis(500));
                 }
             }
@@ -1781,20 +1994,22 @@ impl eframe::App for App {
                 if pm < 1.0 {
                     self.anim = true;
                 }
-                p.rect_filled(full, 0.0, Color32::from_black_alpha((140.0 * pm) as u8));
-                let m = Rect::from_center_size(full.center(), vec2(720.0, 440.0));
-                glass(&p, m, 22.0, bl, full, pm);
+                p.rect_filled(full, 0.0, Color32::from_black_alpha((150.0 * pm) as u8));
+                let m = Rect::from_center_size(full.center(), vec2(760.0, 470.0));
+                glass(&p, m, 26.0, bl, full, pm);
                 let wt = |a: u8| Color32::from_white_alpha((a as f32 * pm) as u8);
-                let pr = Rect::from_min_size(m.min + vec2(28.0, 28.0), vec2(130.0, 195.0));
-                let pp = rounded_pts(pr, 10.0);
+                let pr = Rect::from_min_size(m.min + vec2(30.0, 30.0), vec2(140.0, 210.0));
+                let pp = rounded_pts(pr, 12.0);
+                p.rect_filled(pr.expand(4.0).translate(vec2(0.0, 8.0)), 16.0, Color32::from_black_alpha((70.0 * pm) as u8));
                 match &poster {
                     Some(tx) => round_img(&p, &pp, tx.id(), |pt| pos2((pt.x - pr.min.x) / pr.width(), (pt.y - pr.min.y) / pr.height()), Color32::WHITE.gamma_multiply(pm)),
                     None => {
-                        p.add(Shape::convex_polygon(pp, tint(&name).gamma_multiply(pm), Stroke::NONE));
+                        p.add(Shape::convex_polygon(pp.clone(), tint(&name).gamma_multiply(pm), Stroke::NONE));
                     }
                 }
-                let tx0 = m.left() + 28.0 + 130.0 + 28.0;
-                p.text(pos2(tx0, m.top() + 26.0), Align2::LEFT_TOP, trunc(&name, 38), FontId::proportional(26.0), wt(255));
+                p.add(Shape::closed_line(pp, Stroke::new(1.0, wt(40))));
+                let tx0 = m.left() + 30.0 + 140.0 + 30.0;
+                p.text(pos2(tx0, m.top() + 28.0), Align2::LEFT_TOP, trunc(&name, 34), fb(28.0), wt(255));
                 let rows: Vec<(&str, String)> = vec![
                     ("Type", if kind == Kind::Zip { "Zipped archive".into() } else { "Folder".into() }),
                     ("Location", elide(&gpath.to_string_lossy(), 44)),
@@ -1810,26 +2025,23 @@ impl eframe::App for App {
                     ("Last played", fmt_last(last)),
                 ];
                 for (i, (lb, v)) in rows.iter().enumerate() {
-                    let y = m.top() + 68.0 + i as f32 * 24.0;
-                    p.text(pos2(tx0, y), Align2::LEFT_TOP, *lb, FontId::proportional(14.0), wt(150));
-                    p.text(pos2(tx0 + 120.0, y), Align2::LEFT_TOP, v, FontId::proportional(15.0), wt(240));
+                    let y = m.top() + 76.0 + i as f32 * 25.0;
+                    p.text(pos2(tx0, y), Align2::LEFT_TOP, *lb, FontId::proportional(13.0), wt(140));
+                    p.text(pos2(tx0 + 124.0, y), Align2::LEFT_TOP, v, FontId::proportional(15.0), wt(240));
                 }
                 let corner = self.prefs.corner as usize % 4;
                 let ov_label = format!("Overlay: {}", CORNERS[corner]);
-                let defs: [(&str, f32); 4] = [("Open folder", 150.0), ("Change exe", 140.0), (ov_label.as_str(), 190.0), ("Close", 100.0)];
-                let by = m.bottom() - 62.0;
-                let mut x = m.left() + 28.0;
+                let defs: [(&str, f32); 4] = [("Open folder", 150.0), ("Change exe", 140.0), (ov_label.as_str(), 200.0), ("Close", 100.0)];
+                let by = m.bottom() - 66.0;
+                let mut x = m.left() + 30.0;
                 let mut clicks = [false; 4];
                 for (i, (txt, w)) in defs.iter().enumerate() {
-                    let b = Rect::from_min_size(pos2(x, by), vec2(*w, 40.0));
+                    let b = Rect::from_min_size(pos2(x, by), vec2(*w, 42.0));
                     x += *w + 12.0;
                     let rs = ui.interact(b, Id::new(("mb", i)), csense());
-                    p.add(Shape::convex_polygon(
-                        rounded_pts(b, 20.0),
-                        Color32::from_white_alpha(((if rs.hovered() { 70.0 } else { 40.0 }) * pm) as u8),
-                        Stroke::new(1.0, wt(90)),
-                    ));
-                    p.text(b.center(), Align2::CENTER_CENTER, *txt, FontId::proportional(15.0), wt(255));
+                    let a = if rs.hovered() { 70.0 } else { 36.0 };
+                    p.add(Shape::convex_polygon(rounded_pts(b, 21.0), Color32::from_white_alpha((a * pm) as u8), Stroke::new(1.0, wt(80))));
+                    p.text(b.center(), Align2::CENTER_CENTER, *txt, fb(14.0), wt(255));
                     clicks[i] = rs.clicked() && self.props;
                 }
                 if clicks[0] {
