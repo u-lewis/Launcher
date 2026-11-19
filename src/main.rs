@@ -64,6 +64,7 @@ struct Assets {
     logo: Option<TextureHandle>,
     meta: Option<Meta>,
     size: Option<u64>,
+    born: f64, // when the poster/hero bundle arrived (for the fade-in)
 }
 
 enum Msg {
@@ -72,6 +73,7 @@ enum Msg {
     Logo(ColorImage),
     Meta(Meta),
     Size(u64),
+    Batch(Vec<Msg>), // everything for one game, applied in a single frame
 }
 
 #[derive(Default)]
@@ -552,14 +554,17 @@ fn scan(dir: &Path, prefs: &Prefs) -> Vec<Game> {
 
 fn extract(zip_path: PathBuf, dest: PathBuf, job: Arc<Mutex<Job>>, ctx: Context) {
     thread::spawn(move || {
+        // The source zip is only ever opened read-only; files go to a hidden staging folder first.
+        let tmp = dest.with_file_name(format!(".{}.part", dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()));
         let r = (|| -> Result<(), Box<dyn std::error::Error>> {
             let mut ar = zip::ZipArchive::new(fs::File::open(&zip_path)?)?;
             let n = ar.len().max(1);
-            fs::create_dir_all(&dest)?;
+            let _ = fs::remove_dir_all(&tmp);
+            fs::create_dir_all(&tmp)?;
             for i in 0..ar.len() {
                 let mut f = ar.by_index(i)?;
                 let Some(rel) = f.enclosed_name() else { continue };
-                let out = dest.join(rel);
+                let out = tmp.join(rel);
                 if f.is_dir() {
                     fs::create_dir_all(&out)?;
                 } else {
@@ -573,8 +578,12 @@ fn extract(zip_path: PathBuf, dest: PathBuf, job: Arc<Mutex<Job>>, ctx: Context)
                     ctx.request_repaint();
                 }
             }
+            fs::rename(&tmp, &dest)?;
             Ok(())
         })();
+        if r.is_err() {
+            let _ = fs::remove_dir_all(&tmp);
+        }
         let mut j = job.lock().unwrap();
         j.error = r.err().map(|e| e.to_string());
         j.done = true;
@@ -685,6 +694,30 @@ fn decode(k: usize, p: &Path) -> Option<Msg> {
     })
 }
 
+fn apply_msg(ctx: &Context, n: &str, a: &mut Assets, m: Msg, now: f64) {
+    let lt = |s: &str, c: ColorImage| ctx.load_texture(format!("{n}-{s}"), c, TextureOptions::LINEAR);
+    match m {
+        Msg::Poster(c, sm) => {
+            a.poster = Some(lt("p", c));
+            a.poster_s = Some(lt("ps", sm));
+            a.born = now;
+        }
+        Msg::Hero(c, b) => {
+            a.hero = Some(lt("h", c));
+            a.blur = Some(lt("b", b));
+            a.born = now;
+        }
+        Msg::Logo(c) => a.logo = Some(lt("l", c)),
+        Msg::Meta(m) => a.meta = Some(m),
+        Msg::Size(s) => a.size = Some(s),
+        Msg::Batch(v) => {
+            for m in v {
+                apply_msg(ctx, n, a, m, now);
+            }
+        }
+    }
+}
+
 fn load_game(name: String, folder: Option<PathBuf>, zip_len: u64, cache: PathBuf, tx: mpsc::Sender<(String, Msg)>, ctx: Context) {
     thread::spawn(move || {
         let send = |m: Msg| {
@@ -700,32 +733,46 @@ fn load_game(name: String, folder: Option<PathBuf>, zip_len: u64, cache: PathBuf
             ("hero", &["hero.jpg", "hero.png", "background.jpg", "background.png"][..], "library_hero.jpg"),
             ("logo", &["logo.png"][..], "logo.png"),
         ];
-        let mut sent = [false; 3];
+        let mut got: [Option<Msg>; 3] = [None, None, None];
+        let fresh_none = |stem: &str| {
+            fs::metadata(cache.join(format!("{stem}.none")))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map_or(false, |e| e.as_secs() < 1_800)
+        };
         let mut meta = read_meta(&cache);
         for pass in 0..2 {
+            if pass == 1 && got.iter().all(|g| g.is_some()) {
+                break;
+            }
             if pass == 1 && meta.is_none() {
                 meta = resolve_meta(&name, folder.as_deref(), &cache);
-            }
-            if let Some(m) = &meta {
-                send(Msg::Meta(m.clone()));
             }
             let id = if pass == 1 { meta.as_ref().map(|m| m.appid).filter(|&i| i > 0) } else { None };
             if pass == 1 && id.is_none() {
                 break;
             }
             for (k, (stem, locals, remote)) in kinds.iter().enumerate() {
-                if sent[k] {
+                if got[k].is_some() || (pass == 1 && fresh_none(stem)) {
                     continue;
                 }
                 let urls: Vec<String> = id.map(|id| BASES.iter().map(|b| format!("{b}/{id}/{remote}")).collect()).unwrap_or_default();
                 if let Some(p) = find_or_get(&local(locals), &cache.join(format!("{stem}.img")), &urls) {
-                    if let Some(m) = decode(k, &p) {
-                        send(m);
-                        sent[k] = true;
-                    }
+                    got[k] = decode(k, &p);
+                }
+                if pass == 1 && got[k].is_none() {
+                    let _ = fs::write(cache.join(format!("{stem}.none")), b"");
                 }
             }
         }
+        // one message per game: poster, backdrop, logo and meta show up together
+        let mut batch = vec![];
+        if let Some(m) = &meta {
+            batch.push(Msg::Meta(m.clone()));
+        }
+        batch.extend(got.into_iter().flatten());
+        send(Msg::Batch(batch));
         let sz = match &folder {
             Some(d) => dir_size(d),
             None => zip_len,
@@ -1055,9 +1102,17 @@ fn overlay(ctx: &Context, m: &Arc<Mutex<Metrics>>) {
 }
 
 // ---------- drawing ----------
+/// Apple-style continuous corners (superellipse) with dense sampling.
 fn rounded_pts(r: Rect, rad: f32) -> Vec<Pos2> {
+    rounded_pts_p(r, rad, 3.2)
+}
+
+/// `pw` = corner exponent: 2.0 is a true circle arc, ~3.2 is the continuous "squircle" corner.
+fn rounded_pts_p(r: Rect, rad: f32, pw: f32) -> Vec<Pos2> {
+    let rad = rad.min(r.width() / 2.0).min(r.height() / 2.0);
     let mut v = vec![];
-    let n = 8;
+    let n = 20;
+    let e = 2.0 / pw;
     let corners = [
         (r.right_top() + vec2(-rad, rad), -90.0_f32),
         (r.right_bottom() + vec2(-rad, -rad), 0.0),
@@ -1067,19 +1122,47 @@ fn rounded_pts(r: Rect, rad: f32) -> Vec<Pos2> {
     for (c, start) in corners {
         for i in 0..=n {
             let a = (start + 90.0 * i as f32 / n as f32).to_radians();
-            v.push(c + vec2(a.cos(), a.sin()) * rad);
+            let (co, si) = (a.cos(), a.sin());
+            v.push(c + vec2(co.signum() * co.abs().powf(e), si.signum() * si.abs().powf(e)) * rad);
         }
     }
     v
 }
 
+/// Outward unit normals of a clockwise polygon (used for 1px anti-aliasing feathers).
+fn normals(pts: &[Pos2]) -> Vec<Vec2> {
+    let n = pts.len();
+    let edge = |a: Pos2, b: Pos2| {
+        let d = b - a;
+        vec2(d.y, -d.x).normalized()
+    };
+    (0..n)
+        .map(|i| {
+            let (p0, p1, p2) = (pts[(i + n - 1) % n], pts[i], pts[(i + 1) % n]);
+            let m = edge(p0, p1) + edge(p1, p2);
+            if m.length() < 1e-4 { edge(p1, p2) } else { m.normalized() }
+        })
+        .collect()
+}
+
 fn round_img(p: &Painter, pts: &[Pos2], tex: TextureId, uvf: impl Fn(Pos2) -> Pos2, tint: Color32) {
     let mut m = Mesh::with_texture(tex);
+    let k = pts.len() as u32;
     for &pos in pts {
         m.vertices.push(Vertex { pos, uv: uvf(pos), color: tint });
     }
-    for i in 1..pts.len() - 1 {
-        m.add_triangle(0, i as u32, i as u32 + 1);
+    for i in 1..k - 1 {
+        m.add_triangle(0, i, i + 1);
+    }
+    // 1px transparent feather ring => smooth, alias-free silhouette
+    for (&pos, nrm) in pts.iter().zip(normals(pts)) {
+        let o = pos + nrm;
+        m.vertices.push(Vertex { pos: o, uv: uvf(o), color: Color32::TRANSPARENT });
+    }
+    for i in 0..k {
+        let j = (i + 1) % k;
+        m.add_triangle(i, j, k + j);
+        m.add_triangle(i, k + j, k + i);
     }
     p.add(Shape::mesh(m));
 }
@@ -1102,63 +1185,103 @@ fn uv_full() -> Rect {
 
 fn fan(p: &Painter, pts: &[Pos2], f: impl Fn(Pos2) -> Color32) {
     let mut m = Mesh::default();
+    let k = pts.len() as u32;
     for &pos in pts {
         m.colored_vertex(pos, f(pos));
     }
-    for i in 1..pts.len() - 1 {
-        m.add_triangle(0, i as u32, i as u32 + 1);
+    for i in 1..k - 1 {
+        m.add_triangle(0, i, i + 1);
+    }
+    for (&pos, nrm) in pts.iter().zip(normals(pts)) {
+        m.colored_vertex(pos + nrm, Color32::TRANSPARENT);
+    }
+    for i in 0..k {
+        let j = (i + 1) % k;
+        m.add_triangle(i, j, k + j);
+        m.add_triangle(i, k + j, k + i);
     }
     p.add(Shape::mesh(m));
 }
 
-/// Frosted glass: blurred backdrop (sampled at the panel's own position), frost gradient, light-catching edge.
-fn glass(p: &Painter, rect: Rect, rad: f32, bl: Option<(&TextureHandle, Rect)>, full: Rect, k: f32) {
-    let pts = rounded_pts(rect, rad);
-    for (e, dy, a) in [(10.0_f32, 14.0_f32, 14.0_f32), (5.0, 8.0, 20.0), (1.0, 3.0, 30.0)] {
-        p.rect_filled(rect.expand(e).translate(vec2(0.0, dy)), rad + e, Color32::from_black_alpha((a * k) as u8));
+/// Layered mesh: rings of identical point count stitched together, innermost ring filled.
+fn layered(p: &Painter, tex: Option<TextureId>, rings: &[Vec<Vertex>]) {
+    let mut m = match tex {
+        Some(t) => Mesh::with_texture(t),
+        None => Mesh::default(),
+    };
+    let k = rings[0].len() as u32;
+    for r in rings {
+        m.vertices.extend(r.iter().copied());
     }
-    match bl {
-        Some((tex, uv)) => round_img(
-            p,
-            &pts,
-            tex.id(),
-            |pt| {
-                pos2(
-                    uv.min.x + (pt.x - full.min.x) / full.width() * uv.width(),
-                    uv.min.y + (pt.y - full.min.y) / full.height() * uv.height(),
-                )
-            },
-            Color32::from_gray(86).gamma_multiply(k),
-        ),
-        None => {
-            p.add(Shape::convex_polygon(pts.clone(), Color32::from_rgba_unmultiplied(20, 26, 46, (230.0 * k) as u8), Stroke::NONE));
+    for j in 0..rings.len() as u32 - 1 {
+        let (a, b) = (j * k, (j + 1) * k);
+        for i in 0..k {
+            let i2 = (i + 1) % k;
+            m.add_triangle(a + i, a + i2, b + i2);
+            m.add_triangle(a + i, b + i2, b + i);
         }
     }
-    fan(p, &pts, |_| Color32::from_black_alpha((48.0 * k) as u8));
-    let (y0, h) = (rect.top(), rect.height().max(1.0));
-    fan(p, &pts, |pt| {
-        let t = ((pt.y - y0) / h).clamp(0.0, 1.0);
-        Color32::from_white_alpha(((30.0 - 18.0 * t) * k) as u8)
-    });
-    let n = pts.len();
-    for i in 0..n {
-        let (a, b) = (pts[i], pts[(i + 1) % n]);
-        let m = a.lerp(b, 0.5);
-        let t = ((m.x - rect.min.x) / rect.width().max(1.0) + (m.y - rect.min.y) / h) * 0.5;
-        let al = ((120.0 - 90.0 * t.clamp(0.0, 1.0)) * k) as u8;
-        p.line_segment([a, b], Stroke::new(1.0, Color32::from_white_alpha(al)));
+    let last = (rings.len() as u32 - 1) * k;
+    for i in 1..k - 1 {
+        m.add_triangle(last, last + i, last + i + 1);
     }
+    p.add(Shape::mesh(m));
 }
 
-fn keycap(p: &Painter, x: f32, cy: f32, key: &str, label: &str) -> f32 {
-    let kg = p.layout_no_wrap(key.to_string(), FontId::proportional(10.5), Color32::from_white_alpha(225));
-    let kw = (kg.size().x + 16.0).max(24.0);
-    let kr = Rect::from_min_size(pos2(x, cy - 10.0), vec2(kw, 20.0));
-    p.rect_filled(kr, 10.0, Color32::from_white_alpha(24));
-    p.rect_stroke(kr, 10.0, Stroke::new(1.0, Color32::from_white_alpha(70)));
-    p.text(kr.center(), Align2::CENTER_CENTER, key, FontId::proportional(10.5), Color32::from_white_alpha(225));
-    let lr = p.text(pos2(kr.right() + 8.0, cy), Align2::LEFT_CENTER, label, FontId::proportional(13.0), Color32::from_white_alpha(150));
-    lr.right() + 24.0
+/// Liquid-glass panel: blurred backdrop bent (refracted) at a bevelled rim, thin tint,
+/// light-catching specular edge from the top-left and a faint bounce light bottom-right.
+fn glass(p: &Painter, rect: Rect, rad: f32, bl: Option<(&TextureHandle, Rect)>, full: Rect, k: f32) {
+    for (e, dy, a) in [(24.0_f32, 20.0_f32, 7.0_f32), (12.0, 12.0, 11.0), (4.0, 5.0, 15.0)] {
+        p.rect_filled(rect.expand(e).translate(vec2(0.0, dy)), rad + e, Color32::from_black_alpha((a * k) as u8));
+    }
+    if bl.is_none() {
+        p.add(Shape::convex_polygon(rounded_pts(rect, rad), Color32::from_rgba_unmultiplied(30, 38, 62, (215.0 * k) as u8), Stroke::NONE));
+    }
+    let light = vec2(-0.55, -0.83);
+    let bevel = (rad * 0.85).min(rect.height() * 0.4).max(5.0);
+    const R: i32 = 7;
+    let uv_of = |pos: Pos2| match bl {
+        Some((_, uv)) => pos2(
+            uv.min.x + (pos.x - full.min.x) / full.width() * uv.width(),
+            uv.min.y + (pos.y - full.min.y) / full.height() * uv.height(),
+        ),
+        None => epaint::WHITE_UV,
+    };
+    let (mut tex_rings, mut lit_rings) = (vec![], vec![]);
+    for j in -1..=R {
+        let inset = if j < 0 { -1.0 } else { bevel * j as f32 / R as f32 };
+        let pts = rounded_pts(rect.shrink(inset), (rad - inset).max(3.0));
+        let nr = normals(&pts);
+        let t = if j < 0 { 0.0 } else { j as f32 / R as f32 };
+        let f = (1.0 - t) * (1.0 - t);
+        let (mut tv, mut lv) = (vec![], vec![]);
+        for (&pos, n) in pts.iter().zip(nr) {
+            let l = n.dot(light);
+            let tc = if j < 0 { Color32::TRANSPARENT } else { Color32::from_gray((176.0 - 58.0 * t) as u8).gamma_multiply(k) };
+            tv.push(Vertex { pos, uv: uv_of(pos - n * (f * 15.0)), color: tc });
+            let a = if j < 0 {
+                0.0
+            } else {
+                let sheen = 6.0 + 9.0 * (1.0 - ((pos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0));
+                (f * (26.0 + 80.0 * l.max(0.0) + 26.0 * (-l).max(0.0)) + sheen) * k
+            };
+            lv.push(Vertex { pos, uv: epaint::WHITE_UV, color: Color32::from_white_alpha(a as u8) });
+        }
+        tex_rings.push(tv);
+        lit_rings.push(lv);
+    }
+    layered(p, bl.map(|(t, _)| t.id()), &tex_rings);
+    layered(p, None, &lit_rings);
+    // crisp specular rim
+    let pts = rounded_pts(rect.shrink(0.5), (rad - 0.5).max(3.0));
+    let nr = normals(&pts);
+    let n = pts.len();
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let l = (nr[i] + nr[j]).normalized().dot(light);
+        let al = ((40.0 + 150.0 * l.max(0.0) + 55.0 * (-l).max(0.0)) * k) as u8;
+        p.line_segment([pts[i], pts[j]], Stroke::new(1.0, Color32::from_white_alpha(al)));
+    }
 }
 
 fn grad(p: &Painter, r: Rect, c0: Color32, c1: Color32, horizontal: bool) {
@@ -1201,18 +1324,196 @@ fn background(p: &Painter, r: Rect) {
     }
 }
 
-fn splash(p: &Painter, r: Rect, t: f64) {
-    background(p, r);
-    let a = ((t / 0.8).min(1.0) * ((SPLASH - t) / 0.5).clamp(0.0, 1.0)) as f32;
+fn ease(x: f64) -> f32 {
+    let x = x.clamp(0.0, 1.0) as f32;
+    x * x * (3.0 - 2.0 * x)
+}
+
+/// Glass orb/tile over black: bevel rings refract the logo per wavelength (R/G/B drawn additively
+/// with different bend), plus chromatic specular rim streaks.
+fn orb(p: &Painter, rect: Rect, rad: f32, pw: f32, logo: Option<(&Logo, Rect)>, k: f32, s: f32, grain: f32) {
+    if k <= 0.003 {
+        return;
+    }
+    let light = vec2(-0.55, -0.83);
+    let bevel = (rad * 0.85).min(rect.height() * 0.4).max(5.0);
+    const R: i32 = 8;
+    let mut lit = vec![];
+    let mut geo = vec![];
+    for j in -1..=R {
+        let inset = if j < 0 { -1.0 } else { bevel * j as f32 / R as f32 };
+        let pts = rounded_pts_p(rect.shrink(inset), (rad - inset).max(3.0), pw);
+        let nr = normals(&pts);
+        let t = if j < 0 { 0.0 } else { j as f32 / R as f32 };
+        let f = (1.0 - t) * (1.0 - t);
+        let mut lv = vec![];
+        for (&pos, &n) in pts.iter().zip(nr.iter()) {
+            let l = n.dot(light);
+            let a = if j < 0 {
+                0.0
+            } else {
+                let sheen = 5.0 + 11.0 * (1.0 - ((pos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0));
+                (f * (30.0 + 90.0 * l.max(0.0) + 34.0 * (-l).max(0.0)) + sheen) * k
+            };
+            lv.push(Vertex { pos, uv: epaint::WHITE_UV, color: Color32::from_white_alpha(a.min(255.0) as u8) });
+        }
+        lit.push(lv);
+        geo.push((pts, nr, f, j < 0));
+    }
+    layered(p, None, &lit);
+    if let Some((lg, lr)) = logo {
+        if s > 0.003 {
+            // wavelength-split refraction: warm + cool fringes (tinted mask) behind the true logo pass
+            for (mask, col, disp, a0) in [(true, (255u8, 150u8, 120u8), 11.0_f32, 0.38_f32), (true, (150, 225, 255), 19.0, 0.38), (false, (255, 255, 255), 15.0, 1.0)] {
+                let rings: Vec<Vec<Vertex>> = geo
+                    .iter()
+                    .map(|(pts, nr, f, feather)| {
+                        pts.iter()
+                            .zip(nr.iter())
+                            .map(|(&pos, &n)| {
+                                let q = pos - n * (*f * disp * grain);
+                                let uv = pos2((q.x - lr.min.x) / lr.width(), (q.y - lr.min.y) / lr.height());
+                                let inside = (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y);
+                                let a = if *feather || !inside { 0.0 } else { s * a0 };
+                                let color = if mask { Color32::from_rgba_unmultiplied(col.0, col.1, col.2, (a * 255.0) as u8) } else { Color32::from_white_alpha((a * 255.0) as u8) };
+                                Vertex { pos, uv, color }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                layered(p, Some(if mask { lg.mask.id() } else { lg.tex.id() }), &rings);
+            }
+        }
+    }
+    for (ins, col, w) in [(0.3_f32, (255u8, 90u8, 110u8), 0.55_f32), (1.2, (255, 255, 255), 0.75), (2.2, (90, 140, 255), 0.55)] {
+        let pts = rounded_pts_p(rect.shrink(ins), (rad - ins).max(3.0), pw);
+        let nr = normals(&pts);
+        let n = pts.len();
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let l = (nr[i] + nr[j]).normalized().dot(light);
+            let al = ((30.0 + 210.0 * l.max(0.0).powf(1.6) + 70.0 * (-l).max(0.0).powf(1.6)) * k * w).min(255.0) as u8;
+            p.line_segment([pts[i], pts[j]], Stroke::new(1.0, Color32::from_rgba_unmultiplied(col.0, col.1, col.2, al)));
+        }
+    }
+}
+
+const BLUE: (u8, u8, u8) = (0x2C, 0x56, 0xE8);
+
+struct Logo {
+    tex: TextureHandle,
+    mask: TextureHandle, // same shape, white: lets the splash tint refraction fringes
+}
+
+/// Abstract pattern on the right side only: soft discs, drifting rings, dot grid, diagonal hatch.
+fn splash_pattern(p: &Painter, r: Rect, t: f64, a: f32, reduced: bool) {
+    if a <= 0.003 {
+        return;
+    }
+    let (w, h) = (r.width(), r.height());
+    let drift = if reduced { 0.0 } else { t as f32 };
+    let fall = |x: f32| {
+        let u = ((x - (r.left() + w * 0.42)) / (w * 0.58)).clamp(0.0, 1.0);
+        u * u * (3.0 - 2.0 * u)
+    };
+    let disc = |cx: f32, cy: f32, rad: f32, col: Color32, al: f32| p.circle_filled(pos2(cx, cy), rad, col.gamma_multiply(al * a));
+    disc(r.right() - w * 0.10, r.top() + h * 0.22, h * 0.46, Color32::from_rgb(74, 120, 255), 0.55);
+    disc(r.right() - w * 0.02, r.bottom() - h * 0.10, h * 0.55, Color32::from_rgb(26, 56, 186), 0.60);
+    disc(r.right() - w * 0.30, r.bottom() - h * 0.30, h * 0.18, Color32::from_rgb(96, 140, 255), 0.45);
+    // rings
+    let c = pos2(r.right() - w * 0.06, r.center().y);
+    let (step, maxr) = (h * 0.105, w * 0.5);
+    let off = (drift * 9.0) % step;
+    for i in 0..12 {
+        let rad = step * i as f32 + off;
+        if rad < 8.0 || rad > maxr {
+            continue;
+        }
+        let al = (1.0 - rad / maxr).powf(1.4) * 0.30 * a;
+        p.circle_stroke(c, rad, Stroke::new(1.4, Color32::from_white_alpha((al * 255.0) as u8)));
+    }
+    // dot grid
+    let gs = 26.0;
+    let rows = (h / gs) as i32 + 1;
+    let cols = (w * 0.58 / gs) as i32 + 1;
+    for row in 0..rows {
+        for col in 0..cols {
+            let x = r.right() - 14.0 - col as f32 * gs - if row % 2 == 1 { gs * 0.5 } else { 0.0 };
+            let y = r.top() + 10.0 + row as f32 * gs;
+            let al = fall(x) * 0.34 * a;
+            if al > 0.01 {
+                p.circle_filled(pos2(x, y), 1.5, Color32::from_white_alpha((al * 255.0) as u8));
+            }
+        }
+    }
+    // diagonal hatch, lower right
+    let hx = r.right() - w * 0.20;
+    for i in 0..16 {
+        let x0 = hx - i as f32 * 16.0 + (drift * 4.0) % 16.0;
+        let al = fall(x0) * 0.20 * a;
+        if al > 0.01 {
+            let y1 = r.bottom() - 28.0;
+            p.line_segment([pos2(x0, y1), pos2(x0 + 120.0, y1 - 120.0)], Stroke::new(1.2, Color32::from_white_alpha((al * 255.0) as u8)));
+        }
+    }
+}
+
+/// Splash on #2C56E8: glass sphere -> glass tile -> tile dissolves, leaving the logo alone. No text.
+fn splash(p: &Painter, r: Rect, t: f64, logo: Option<&Logo>, reduced: bool) {
+    let alive = 1.0 - ease((t - (SPLASH - 0.25)) / 0.25); // exit: everything fades to black (the launcher fades in from black)
+    p.rect_filled(r, 0.0, Color32::from_rgb((BLUE.0 as f32 * alive) as u8, (BLUE.1 as f32 * alive) as u8, (BLUE.2 as f32 * alive) as u8));
+    splash_pattern(p, r, t, ease(t / 0.7) * alive, reduced);
     let c = r.center();
-    let pulse = 70.0 + 6.0 * (t * 4.0).sin() as f32;
-    p.circle_stroke(c - vec2(0.0, 40.0), pulse, Stroke::new(3.0, Color32::from_white_alpha((200.0 * a) as u8)));
-    p.circle_stroke(c - vec2(0.0, 40.0), pulse * 0.7, Stroke::new(2.0, Color32::from_rgba_unmultiplied(90, 150, 255, (220.0 * a) as u8)));
-    p.text(c + vec2(0.0, 90.0), Align2::CENTER_CENTER, "L A U N C H E R", fb(30.0), Color32::from_white_alpha((255.0 * a) as u8));
-    let w = 220.0;
-    let bar = Rect::from_center_size(c + vec2(0.0, 135.0), vec2(w, 4.0));
-    p.rect_filled(bar, 2.0, Color32::from_white_alpha((40.0 * a) as u8));
-    p.rect_filled(Rect::from_min_size(bar.min, vec2(w * (t / SPLASH).min(1.0) as f32, 4.0)), 2.0, Color32::from_white_alpha((230.0 * a) as u8));
+    // measured fit: 200px logo (longest side), shrunk when the window is small
+    let size = 200.0_f32.min(r.height() * 0.42).min(r.width() * 0.42);
+    let (lw, lh) = match logo {
+        Some(l) => {
+            let s = l.tex.size_vec2();
+            let sc = size / s.x.max(s.y);
+            (s.x * sc, s.y * sc)
+        }
+        None => (size, size),
+    };
+    let lrect = Rect::from_center_size(c, vec2(lw, lh));
+    let (appear, morph, reveal, glass_k) = if reduced {
+        (1.0, 1.0, ease((t - 0.2) / 0.5), 0.0)
+    } else {
+        (ease((t - 0.1) / 0.6), ease((t - 0.8) / 0.7), ease((t - 1.1) / 0.6), 1.0 - ease((t - 1.7) / 0.45))
+    };
+    let kk = glass_k * appear * alive;
+    let tile = size * 1.45 * (0.6 + 0.4 * appear);
+    let rect = Rect::from_center_size(c, vec2(tile, tile));
+    let rad = tile * 0.5 + (tile * 0.26 - tile * 0.5) * morph;
+    let pw = 2.0 + 1.2 * morph;
+    let grain = 2.2 + (1.0 - 2.2) * morph;
+    orb(p, rect, rad, pw, logo.map(|l| (l, lrect)), kk, reveal * kk, grain);
+    let la = reveal * (1.0 - glass_k * appear) * alive;
+    match logo {
+        Some(l) => {
+            p.image(l.tex.id(), lrect, uv_full(), Color32::from_white_alpha((la * 255.0) as u8));
+        }
+        None => {
+            let a = (la * 255.0) as u8;
+            p.circle_stroke(c, size * 0.38, Stroke::new(3.0, Color32::from_white_alpha(a)));
+        }
+    }
+}
+
+/// Project logo, embedded in the exe (assets/logo.png, rasterized from the supplied SVG).
+fn load_logo(ctx: &Context) -> Option<Logo> {
+    let img = image::load_from_memory(include_bytes!("../assets/logo.png")).ok()?;
+    let img = if img.width() > 512 || img.height() > 512 { img.resize(512, 512, image::imageops::FilterType::CatmullRom) } else { img };
+    let rgba = img.to_rgba8();
+    let mut m = rgba.clone();
+    for px in m.pixels_mut() {
+        px.0[0] = 255;
+        px.0[1] = 255;
+        px.0[2] = 255;
+    }
+    Some(Logo {
+        tex: ctx.load_texture("logo", ci(&rgba), TextureOptions::LINEAR),
+        mask: ctx.load_texture("logo_mask", ci(&m), TextureOptions::LINEAR),
+    })
 }
 
 fn fade_in(p: &Painter, full: Rect, t: f64) {
@@ -1264,6 +1565,8 @@ struct App {
     props: bool,
     pm: f32,
     anim: bool,
+    logo: Option<Logo>,
+    reduced: bool,
 }
 
 impl App {
@@ -1341,6 +1644,8 @@ impl App {
             props: false,
             pm: 0.0,
             anim: true,
+            logo: load_logo(&cc.egui_ctx),
+            reduced: std::env::var_os("LAUNCHER_REDUCE_MOTION").is_some(),
         }
     }
 
@@ -1455,23 +1760,18 @@ impl eframe::App for App {
         let intro = t < SPLASH + 0.65;
         self.anim = intro;
 
-        // receive loaded assets
-        while let Ok((n, m)) = self.rx.try_recv() {
-            let a = self.assets.entry(n.clone()).or_default();
-            let lt = |s: &str, c: ColorImage| ctx.load_texture(format!("{n}-{s}"), c, TextureOptions::LINEAR);
-            match m {
-                Msg::Poster(c, sm) => {
-                    a.poster = Some(lt("p", c));
-                    a.poster_s = Some(lt("ps", sm));
-                }
-                Msg::Hero(c, b) => {
-                    a.hero = Some(lt("h", c));
-                    a.blur = Some(lt("b", b));
-                }
-                Msg::Logo(c) => a.logo = Some(lt("l", c)),
-                Msg::Meta(m) => a.meta = Some(m),
-                Msg::Size(s) => a.size = Some(s),
+        // receive loaded assets (at most 2 games' worth of texture uploads per frame, no hitching)
+        let mut budget = 2;
+        while budget > 0 {
+            let Ok((n, m)) = self.rx.try_recv() else { break };
+            if matches!(m, Msg::Batch(_)) {
+                budget -= 1;
             }
+            let a = self.assets.entry(n.clone()).or_default();
+            apply_msg(ctx, &n, a, m, t_abs);
+        }
+        if budget == 0 {
+            ctx.request_repaint();
         }
 
         egui::CentralPanel::default().frame(Frame::none()).show(ctx, |ui| {
@@ -1479,7 +1779,7 @@ impl eframe::App for App {
             let p = ui.painter().clone();
 
             if t < SPLASH {
-                splash(&p, full, t);
+                splash(&p, full, t, self.logo.as_ref(), self.reduced);
                 return;
             }
 
@@ -1665,8 +1965,8 @@ impl eframe::App for App {
             // asset requests + free textures far from selection
             if !self.view.is_empty() {
                 let n = self.view.len();
-                let lo = self.sel.saturating_sub(1);
-                let hi = (self.sel + 5).min(n - 1);
+                let lo = self.sel.saturating_sub(2);
+                let hi = (self.sel + 6).min(n - 1);
                 for &gi in &self.view[lo..=hi] {
                     let g = &self.games[gi];
                     if self.requested.insert(g.name.clone()) {
@@ -1679,8 +1979,8 @@ impl eframe::App for App {
                 }
                 if self.sel != self.last_sel {
                     self.last_sel = self.sel;
-                    let klo = self.sel.saturating_sub(3);
-                    let khi = (self.sel + 7).min(n - 1);
+                    let klo = self.sel.saturating_sub(8);
+                    let khi = (self.sel + 12).min(n - 1);
                     let keep: HashSet<&String> = self.view[klo..=khi].iter().map(|&i| &self.games[i].name).collect();
                     let drop: Vec<String> = self.assets.keys().filter(|k| !keep.contains(k)).cloned().collect();
                     for k in drop {
@@ -1729,41 +2029,14 @@ impl eframe::App for App {
             let left = full.left() + 72.0;
             let right = full.right() - 72.0;
 
-            // ---- top bar: pill tabs ----
-            let mut tx = left;
-            for (i, tn) in ["All", "Favorites", "Recent"].iter().enumerate() {
-                let on = i == self.tab;
-                let col = if on { Color32::WHITE } else { Color32::from_white_alpha(150) };
-                let g = p.layout_no_wrap(tn.to_string(), if on { fb(17.0) } else { FontId::proportional(17.0) }, col);
-                let pill = Rect::from_min_size(pos2(tx, full.top() + 26.0), vec2(g.size().x + 36.0, 38.0));
-                if on {
-                    glass(&p, pill, 19.0, bl, full, 1.0);
-                }
-                let gp = pill.center() - g.size() / 2.0;
-                p.galley(gp, g, col);
-                if ui.interact(pill, Id::new(("tab", i)), sense).clicked() {
-                    self.tab = i;
-                    self.dirty = true;
-                    self.play(Sfx::Tab);
-                    ctx.request_repaint();
-                }
-                tx += pill.width() + 6.0;
-            }
             // system monitor + clock
-            let cr = p.text(
+            p.text(
                 pos2(right, full.top() + 45.0),
                 Align2::RIGHT_CENTER,
                 chrono::Local::now().format("%H:%M").to_string(),
                 fb(24.0),
                 Color32::WHITE,
             );
-            let sys_txt = format!(
-                "CPU {:.0}%    RAM {:.1}/{:.0} GB",
-                self.sys.global_cpu_usage(),
-                self.sys.used_memory() as f64 / GB,
-                self.sys.total_memory() as f64 / GB
-            );
-            p.text(pos2(cr.left() - 28.0, full.top() + 45.0), Align2::RIGHT_CENTER, sys_txt, FontId::proportional(14.0), Color32::from_white_alpha(160));
             // search pill
             if self.searching || !self.search.is_empty() {
                 let r = Rect::from_center_size(pos2(full.center().x, full.top() + 45.0), vec2(320.0, 38.0));
@@ -1817,12 +2090,12 @@ impl eframe::App for App {
                 }
                 let gi = self.view[i];
                 let name = self.games[gi].name.clone();
-                let zip = self.games[gi].kind == Kind::Zip;
                 let fav = self.prefs.fav.contains(&name);
-                let (pl, ps) = {
+                let (pl, ps, born) = {
                     let a = self.assets.get(&name);
-                    (a.and_then(|a| a.poster.clone()), a.and_then(|a| a.poster_s.clone()))
+                    (a.and_then(|a| a.poster.clone()), a.and_then(|a| a.poster_s.clone()), a.map_or(0.0, |a| a.born))
                 };
+                let pa = ease((t_abs - born) / 0.35);
                 let tex = if ke > 0.3 { pl.or(ps) } else { ps.or(pl) };
                 let rad = 10.0 + 4.0 * ke;
                 let pts = rounded_pts(rect, rad);
@@ -1833,7 +2106,12 @@ impl eframe::App for App {
                 }
                 let dim = (150.0 + 105.0 * ke) as u8;
                 match &tex {
-                    Some(tx) => round_img(&p, &pts, tx.id(), |pt| pos2((pt.x - rect.min.x) / w, (pt.y - rect.min.y) / h), Color32::from_gray(dim)),
+                    Some(tx) => {
+                        if pa < 1.0 {
+                            p.add(Shape::convex_polygon(pts.clone(), tint(&name).gamma_multiply(0.7 + 0.3 * ke), Stroke::NONE));
+                        }
+                        round_img(&p, &pts, tx.id(), |pt| pos2((pt.x - rect.min.x) / w, (pt.y - rect.min.y) / h), Color32::from_gray(dim).gamma_multiply(pa));
+                    }
                     None => {
                         let c0 = tint(&name).gamma_multiply(0.7 + 0.3 * ke);
                         let c1 = c0.gamma_multiply(0.4);
@@ -1844,11 +2122,6 @@ impl eframe::App for App {
                     }
                 }
                 p.add(Shape::closed_line(pts.clone(), Stroke::new(1.0, Color32::from_white_alpha(30))));
-                if zip {
-                    let b = Rect::from_min_size(rect.left_top() + vec2(8.0, 8.0), vec2(34.0, 18.0));
-                    p.rect_filled(b, 9.0, Color32::from_black_alpha(170));
-                    p.text(b.center(), Align2::CENTER_CENTER, "ZIP", fb(10.0), Color32::WHITE);
-                }
                 if fav {
                     let c = rect.right_top() + vec2(-15.0, 15.0);
                     p.circle_filled(c, 6.0, Color32::from_rgb(255, 196, 60));
@@ -1890,8 +2163,7 @@ impl eframe::App for App {
             let (launches, secs, last) = (st["n"].as_u64().unwrap_or(0), st["secs"].as_u64().unwrap_or(0), st["last"].as_u64().unwrap_or(0));
             let size_s = size.map_or("Calculating…".to_string(), fmt_size);
 
-            let strip = Rect::from_min_size(pos2(left, full.bottom() - 104.0), vec2(right - left, 62.0));
-            let btn_y = strip.top() - 64.0;
+            let btn_y = full.bottom() - 120.0;
             let desc: String = meta.desc.chars().take(230).collect();
             let gal = p.layout(desc, FontId::proportional(16.0), Color32::from_white_alpha(210), 520.0);
             let desc_h = if meta.desc.is_empty() { 0.0 } else { gal.size().y };
@@ -1942,35 +2214,6 @@ impl eframe::App for App {
             }
             if r2.clicked() {
                 open_props = true;
-            }
-
-            // glass info strip
-            glass(&p, strip, 18.0, bl, full, 1.0);
-            let cols = [
-                ("Developer", trunc(&meta.dev, 18)),
-                ("Genre", trunc(&meta.genres, 22)),
-                ("Size", size_s.clone()),
-                ("Release", trunc(&meta.release, 14)),
-                ("Last played", fmt_last(last)),
-                ("Play time", fmt_time(secs)),
-            ];
-            let cw = (strip.width() - 40.0) / cols.len() as f32;
-            for (i, (lb, v)) in cols.iter().enumerate() {
-                let x = strip.left() + 22.0 + cw * i as f32;
-                if i > 0 {
-                    p.line_segment(
-                        [pos2(x - 14.0, strip.top() + 14.0), pos2(x - 14.0, strip.bottom() - 14.0)],
-                        Stroke::new(1.0, Color32::from_white_alpha(28)),
-                    );
-                }
-                p.text(pos2(x, strip.top() + 12.0), Align2::LEFT_TOP, *lb, FontId::proportional(12.0), Color32::from_white_alpha(150));
-                p.text(pos2(x, strip.top() + 30.0), Align2::LEFT_TOP, v, fb(16.0), Color32::WHITE);
-            }
-            // button hints
-            let hy = full.bottom() - 22.0;
-            let mut hx = left;
-            for (k, l) in [("A / Enter", "Play"), ("X / I", "Details"), ("Y / F", "Favorite"), ("LB RB / Tab", "Tabs"), ("/", "Search"), ("M", "Sound")] {
-                hx = keycap(&p, hx, hy, k, l);
             }
 
             // progress + toast
@@ -2139,7 +2382,14 @@ fn main() -> eframe::Result<()> {
     });
     let _ = fs::create_dir_all(&dir);
     let opts = eframe::NativeOptions {
-        viewport: ViewportBuilder::default().with_inner_size([1280.0, 720.0]).with_title("Launcher"),
+        viewport: {
+            let mut vb = ViewportBuilder::default().with_inner_size([1280.0, 720.0]).with_title("Launcher");
+            if let Ok(img) = image::load_from_memory(include_bytes!("../assets/icon.png")) {
+                let rgba = img.to_rgba8();
+                vb = vb.with_icon(egui::IconData { width: rgba.width(), height: rgba.height(), rgba: rgba.into_raw() });
+            }
+            vb
+        },
         ..Default::default()
     };
     eframe::run_native("Launcher", opts, Box::new(move |cc| Ok(Box::new(App::new(dir, cc)))))
