@@ -28,7 +28,7 @@ const CORNERS: [&str; 4] = ["Top-left", "Top-right", "Bottom-left", "Bottom-righ
 
 type Stats = Arc<Mutex<Map<String, Value>>>;
 
-const ACC: Color32 = Color32::from_rgb(76, 134, 255);
+const ACC: Color32 = Color32::from_rgb(10, 132, 255);
 fn fb(sz: f32) -> FontId {
     FontId::new(sz, FontFamily::Name("bold".into()))
 }
@@ -1363,38 +1363,9 @@ fn layered(p: &Painter, tex: Option<TextureId>, rings: &[Vec<Vertex>]) {
     p.add(Shape::mesh(m));
 }
 
-/// Liquid-glass panel: blurred backdrop bent (refracted) at a bevelled rim, thin tint,
-/// light-catching specular edge from the top-left and a faint bounce light bottom-right.
+/// Round control material (same soft dark vibrancy as the bars, no bevel / refraction).
 fn glass(p: &Painter, rect: Rect, rad: f32, bl: Option<(&TextureHandle, Rect)>, full: Rect, k: f32) {
-    shadow(p, rect, rad, 34.0, 14.0, 70.0 * k);
-    if bl.is_none() {
-        rr(p, rect, rad, Color32::from_rgba_unmultiplied(30, 38, 62, (215.0 * k) as u8), None);
-    }
-    let _light = vec2(-0.55, -0.83);
-    let bevel = (rad * 0.85).min(rect.height() * 0.4).max(5.0);
-    const R: i32 = 7;
-    let uv_of = |pos: Pos2| match bl {
-        Some((_, uv)) => pos2(
-            uv.min.x + (pos.x - full.min.x) / full.width() * uv.width(),
-            uv.min.y + (pos.y - full.min.y) / full.height() * uv.height(),
-        ),
-        None => epaint::WHITE_UV,
-    };
-    let mut tex_rings = vec![];
-    for j in -1..=R {
-        let inset = if j < 0 { -1.0 } else { bevel * j as f32 / R as f32 };
-        let pts = rounded_pts(rect.shrink(inset), (rad - inset).max(3.0));
-        let nr = normals(&pts);
-        let t = if j < 0 { 0.0 } else { j as f32 / R as f32 };
-        let f = (1.0 - t) * (1.0 - t);
-        let mut tv = vec![];
-        for (&pos, n) in pts.iter().zip(nr) {
-            let tc = if j < 0 { Color32::TRANSPARENT } else { Color32::from_gray((176.0 - 58.0 * t) as u8).gamma_multiply(k) };
-            tv.push(Vertex { pos, uv: uv_of(pos - n * (f * 15.0)), color: tc });
-        }
-        tex_rings.push(tv);
-    }
-    layered(p, bl.map(|(t, _)| t.id()), &tex_rings);
+    soft_glass(p, rect, rad, bl, full, k, 0.0);
 }
 
 /// Dark smoked-glass panel (properties modal): dimmed, lightly see-through backdrop, no white bevel glow.
@@ -1435,15 +1406,11 @@ fn soft_glass(p: &Painter, rect: Rect, rad: f32, bl: Option<(&TextureHandle, Rec
                     uv.min.y + (pos.y - full.min.y) / full.height() * uv.height(),
                 )
             },
-            Color32::from_gray((130.0 + 12.0 * hot) as u8).gamma_multiply(k),
+            Color32::from_gray((92.0 + 14.0 * hot) as u8).gamma_multiply(k),
         ),
-        None => fan(p, &pts, |_| Color32::from_rgba_unmultiplied(34, 42, 70, (150.0 * k) as u8)),
+        None => fan(p, &pts, |_| Color32::from_rgba_unmultiplied(20, 24, 38, (190.0 * k) as u8)),
     }
-    let (top, h) = (rect.top(), rect.height().max(1.0));
-    fan(p, &pts, |pt| {
-        let t = ((pt.y - top) / h).clamp(0.0, 1.0);
-        Color32::from_white_alpha(((12.0 + 8.0 * hot + 0.0 * t) * k) as u8)
-    });
+    fan(p, &pts, |_| Color32::from_rgba_unmultiplied(6, 8, 16, (40.0 * k) as u8));
 }
 
 fn grad(p: &Painter, r: Rect, c0: Color32, c1: Color32, horizontal: bool) {
@@ -2175,7 +2142,7 @@ impl eframe::App for App {
                     self.anim = true;
                 }
                 let ind = Rect::from_min_size(pos2(nav.min.x + pad, nav.min.y + pad + self.nav_x * ih), vec2(iw, ih));
-                rr(&p, ind, ih / 2.0, Color32::from_white_alpha(36), None);
+                rr(&p, ind, ih / 2.0, Color32::from_white_alpha(28), None);
                 for i in 0..3 {
                     let r = Rect::from_min_size(nav.min + vec2(pad, pad + i as f32 * ih), vec2(iw, ih));
                     let rs = ui.interact(r, Id::new(("nav", i)), sense);
@@ -2188,7 +2155,7 @@ impl eframe::App for App {
                     let e = ease(hv as f64);
                     let act = (1.0 - (self.nav_x - i as f32).abs()).clamp(0.0, 1.0);
                     if e > 0.0 && act < 0.5 {
-                        rr(&p, r, ih / 2.0, Color32::from_white_alpha((14.0 * e * (1.0 - act)) as u8), None);
+                        rr(&p, r, ih / 2.0, Color32::from_white_alpha((10.0 * e * (1.0 - act)) as u8), None);
                     }
                     let a = (150.0 + 90.0 * act.max(e * 0.6)) as u8;
                     p.text(r.center(), Align2::CENTER_CENTER, labels[i], fb(14.0), Color32::from_white_alpha(a));
@@ -2309,7 +2276,7 @@ impl eframe::App for App {
 
             let btn_y = full.bottom() - 146.0;
             let desc: String = meta.desc.chars().take(230).collect();
-            let gal = p.layout(desc, FontId::proportional(16.0), Color32::from_white_alpha(210), 520.0);
+            let gal = p.layout(desc, FontId::proportional(15.0), Color32::from_white_alpha(185), 500.0);
             let desc_h = if meta.desc.is_empty() { 0.0 } else { gal.size().y };
             let desc_y = btn_y - 16.0 - desc_h;
             if !meta.desc.is_empty() {
@@ -2338,12 +2305,12 @@ impl eframe::App for App {
             };
             let play = Rect::from_min_size(pos2(left, btn_y), vec2(168.0, 46.0));
             let r1 = ui.interact(play, Id::new("play"), sense);
-            let base = if enabled { if r1.hovered() { 255 } else { 238 } } else { 120 };
             if enabled {
-                shadow(&p, play, 23.0, 22.0, 8.0, 80.0);
+                shadow(&p, play, 23.0, 24.0, 10.0, 90.0);
             }
-            rr(&p, play, 23.0, Color32::from_gray(base), None);
-            p.text(play.center(), Align2::CENTER_CENTER, label, fb(18.0), Color32::from_gray(20));
+            let pf = if !enabled { Color32::from_white_alpha(22) } else if r1.hovered() { Color32::from_rgb(52, 152, 255) } else { ACC };
+            rr(&p, play, 23.0, pf, None);
+            p.text(play.center(), Align2::CENTER_CENTER, label, fb(17.0), if enabled { Color32::WHITE } else { Color32::from_white_alpha(110) });
             if r1.clicked() {
                 activate = true;
             }
@@ -2383,7 +2350,7 @@ impl eframe::App for App {
                 let (fill, edge) = if is_fav {
                     (gold.gamma_multiply(0.16 + 0.12 * e), gold.gamma_multiply(0.6 + 0.3 * e))
                 } else {
-                    (Color32::from_white_alpha((14.0 + 34.0 * e) as u8), Color32::from_white_alpha((56.0 + 70.0 * e) as u8))
+                    (Color32::from_white_alpha((10.0 + 22.0 * e) as u8), Color32::TRANSPARENT)
                 };
                 rr(&p, favr, 16.0, fill, None);
                 let _ = edge;
@@ -2440,9 +2407,14 @@ impl eframe::App for App {
                 self.anim = true;
             }
             if let Some((m, at)) = &self.msg {
-                if t - at < 3.0 {
-                    p.text(pos2(right, btn_y + 23.0), Align2::RIGHT_CENTER, m, fb(17.0), Color32::from_white_alpha(225));
-                    ctx.request_repaint_after(Duration::from_millis(500));
+                let age = (t - at) as f32;
+                if age < 3.0 {
+                    let kk = ((age.min(3.0 - age)) * 5.0).clamp(0.0, 1.0);
+                    let gl = p.layout_no_wrap(m.clone(), fb(14.0), Color32::from_white_alpha((255.0 * kk) as u8));
+                    let r = Rect::from_center_size(pos2(full.center().x, full.bottom() - 100.0), gl.size() + vec2(40.0, 20.0));
+                    soft_glass(&p, r, r.height() / 2.0, bl, full, kk, 0.0);
+                    p.galley(r.center() - gl.size() / 2.0, gl, Color32::WHITE);
+                    ctx.request_repaint_after(Duration::from_millis(33));
                 }
             }
 
