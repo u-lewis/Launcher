@@ -2104,7 +2104,7 @@ impl eframe::App for App {
             let blur_uv = blur_tex.as_ref().map(|b| cover_uv(b.size_vec2(), full));
             let bl = blur_tex.as_ref().zip(blur_uv);
 
-            let left = full.left() + 136.0;
+            let left = full.left() + 72.0;
             let right = full.right() - 72.0;
 
             // system monitor + clock
@@ -2117,7 +2117,7 @@ impl eframe::App for App {
             );
             // search pill
             if self.searching || !self.search.is_empty() {
-                let r = Rect::from_min_size(pos2(left, full.top() + 26.0), vec2(270.0, 38.0));
+                let r = Rect::from_min_size(pos2(full.left() + 24.0 + 88.0 * 3.0 + 8.0 + 16.0, full.top() + 26.0), vec2(270.0, 38.0));
                 soft_glass(&p, r, 19.0, bl, full, 1.0, 0.0);
                 let cursor = if self.searching { "_" } else { "" };
                 p.text(r.center(), Align2::CENTER_CENTER, format!("Search: {}{}", self.search, cursor), FontId::proportional(16.0), Color32::WHITE);
@@ -2125,10 +2125,10 @@ impl eframe::App for App {
             // ---- top navigation: Home / Favourites / Recent ----
             {
                 let labels = ["Home", "Favourites", "Recent"];
-                let (iw, ih, pad) = (104.0_f32, 32.0_f32, 5.0_f32);
+                let (iw, ih, pad) = (88.0_f32, 30.0_f32, 4.0_f32);
                 let nav = Rect::from_min_size(
-                    pos2(full.left() + 16.0, full.center().y - (ih * 3.0 + pad * 2.0) / 2.0),
-                    vec2(iw + pad * 2.0, ih * 3.0 + pad * 2.0),
+                    pos2(full.left() + 24.0, full.top() + 45.0 - (ih + pad * 2.0) / 2.0),
+                    vec2(iw * 3.0 + pad * 2.0, ih + pad * 2.0),
                 );
                 soft_glass(&p, nav, ih / 2.0 + pad, bl, full, 1.0, 0.0);
                 if self.nav_x < 0.0 {
@@ -2141,10 +2141,10 @@ impl eframe::App for App {
                     self.nav_x += nd * (1.0 - (-11.0 * dt).exp());
                     self.anim = true;
                 }
-                let ind = Rect::from_min_size(pos2(nav.min.x + pad, nav.min.y + pad + self.nav_x * ih), vec2(iw, ih));
+                let ind = Rect::from_min_size(pos2(nav.min.x + pad + self.nav_x * iw, nav.min.y + pad), vec2(iw, ih));
                 rr(&p, ind, ih / 2.0, Color32::from_white_alpha(28), None);
                 for i in 0..3 {
-                    let r = Rect::from_min_size(nav.min + vec2(pad, pad + i as f32 * ih), vec2(iw, ih));
+                    let r = Rect::from_min_size(nav.min + vec2(pad + i as f32 * iw, pad), vec2(iw, ih));
                     let rs = ui.interact(r, Id::new(("nav", i)), sense);
                     let tgt = if rs.hovered() { 1.0 } else { 0.0 };
                     let hv = self.nav_hov[i] + (tgt - self.nav_hov[i]) * (1.0 - (-12.0 * dt).exp());
