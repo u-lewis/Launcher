@@ -642,8 +642,83 @@ fn resolve_meta(name: &str, folder: Option<&Path>, cache: &Path) -> Option<Meta>
     let _ = fs::write(cache.join("meta.json"), m.to_json().to_string());
     Some(m)
 }
+/// Finds poster / backdrop / logo images inside a game folder (up to 2 levels deep) by file name,
+/// falling back to image shape for loose files in the folder root. Best candidate first.
+fn scan_images(dir: &Path) -> [Vec<PathBuf>; 3] {
+    // kind order: 0 poster, 1 hero, 2 logo
+    const KEYS: [&[&str]; 3] = [
+        &["poster", "cover", "library_600x900", "portrait", "boxart", "box_art"],
+        &["hero", "library_hero", "background", "backdrop", "fanart", "wallpaper", "banner", "header"],
+        &["library_logo", "logo"],
+    ];
+    let mut c: [Vec<(usize, usize, PathBuf)>; 3] = Default::default();
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    let mut seen = 0usize;
+    while let Some((d, depth)) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            seen += 1;
+            if seen > 800 {
+                break;
+            }
+            let p = e.path();
+            if p.is_dir() {
+                if depth < 2 {
+                    stack.push((p, depth + 1));
+                }
+                continue;
+            }
+            let ext = p.extension().and_then(|x| x.to_str()).map(|x| x.to_lowercase()).unwrap_or_default();
+            if !matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp" | "bmp") {
+                continue;
+            }
+            if !(4_000..=30_000_000).contains(&e.metadata().map_or(0, |m| m.len())) {
+                continue;
+            }
+            let stem = p.file_stem().and_then(|x| x.to_str()).map(|x| x.to_lowercase()).unwrap_or_default();
+            let Ok((w, h)) = image::image_dimensions(&p) else { continue };
+            let mut kind = None;
+            for k in [2usize, 0, 1] {
+                if let Some(pr) = KEYS[k].iter().position(|w| stem.contains(w)) {
+                    kind = Some((k, pr));
+                    break;
+                }
+            }
+            if kind.is_none() && matches!(stem.as_str(), "folder" | "front" | "box") {
+                kind = Some((0, 90));
+            }
+            if kind.is_none() && depth == 0 {
+                // unnamed loose image: guess from its shape
+                if h * 10 >= w * 13 && w >= 300 {
+                    kind = Some((0, 99));
+                } else if w * 10 >= h * 17 && w >= 1280 {
+                    kind = Some((1, 99));
+                }
+            }
+            let Some((k, pr)) = kind else { continue };
+            if (k == 1 && w < 800) || (k == 0 && w < 150) {
+                continue;
+            }
+            c[k].push((depth, pr, p));
+        }
+    }
+    let mut out: [Vec<PathBuf>; 3] = Default::default();
+    for k in 0..3 {
+        c[k].sort_by_key(|(d, pr, _)| (*d, *pr));
+        out[k] = c[k].iter().map(|(_, _, p)| p.clone()).collect();
+    }
+    out
+}
 fn find_or_get(local: &[PathBuf], cache: &Path, urls: &[String]) -> Option<PathBuf> {
     if let Some(p) = local.iter().find(|p| p.exists()) {
+        // keep a copy in the cache so the image survives the folder moving / a slow or missing drive
+        let same = match (fs::metadata(p), fs::metadata(cache)) {
+            (Ok(a), Ok(b)) => a.len() == b.len(),
+            _ => false,
+        };
+        if !same {
+            let _ = fs::copy(p, cache);
+        }
         return Some(p.clone());
     }
     if fs::metadata(cache).map_or(false, |m| m.len() > 0) {
@@ -725,14 +800,8 @@ fn load_game(name: String, folder: Option<PathBuf>, zip_len: u64, cache: PathBuf
             ctx.request_repaint();
         };
         let _ = fs::create_dir_all(&cache);
-        let local = |names: &[&str]| -> Vec<PathBuf> {
-            folder.as_ref().map(|d| names.iter().map(|n| d.join(n)).collect()).unwrap_or_default()
-        };
-        let kinds: [(&str, &[&str], &str); 3] = [
-            ("poster", &["poster.jpg", "poster.png", "cover.jpg", "cover.png"][..], "library_600x900.jpg"),
-            ("hero", &["hero.jpg", "hero.png", "background.jpg", "background.png"][..], "library_hero.jpg"),
-            ("logo", &["logo.png"][..], "logo.png"),
-        ];
+        let found = folder.as_deref().map(scan_images).unwrap_or_default();
+        let kinds: [(&str, &str); 3] = [("poster", "library_600x900.jpg"), ("hero", "library_hero.jpg"), ("logo", "logo.png")];
         let mut got: [Option<Msg>; 3] = [None, None, None];
         let fresh_none = |stem: &str| {
             fs::metadata(cache.join(format!("{stem}.none")))
@@ -753,12 +822,12 @@ fn load_game(name: String, folder: Option<PathBuf>, zip_len: u64, cache: PathBuf
             if pass == 1 && id.is_none() {
                 break;
             }
-            for (k, (stem, locals, remote)) in kinds.iter().enumerate() {
+            for (k, (stem, remote)) in kinds.iter().enumerate() {
                 if got[k].is_some() || (pass == 1 && fresh_none(stem)) {
                     continue;
                 }
                 let urls: Vec<String> = id.map(|id| BASES.iter().map(|b| format!("{b}/{id}/{remote}")).collect()).unwrap_or_default();
-                if let Some(p) = find_or_get(&local(locals), &cache.join(format!("{stem}.img")), &urls) {
+                if let Some(p) = find_or_get(&found[k], &cache.join(format!("{stem}.img")), &urls) {
                     got[k] = decode(k, &p);
                 }
                 if pass == 1 && got[k].is_none() {
@@ -1235,7 +1304,7 @@ fn glass(p: &Painter, rect: Rect, rad: f32, bl: Option<(&TextureHandle, Rect)>, 
         p.rect_filled(rect.expand(e).translate(vec2(0.0, dy)), rad + e, Color32::from_black_alpha((a * k) as u8));
     }
     if bl.is_none() {
-        p.add(Shape::convex_polygon(rounded_pts(rect, rad), Color32::from_rgba_unmultiplied(30, 38, 62, (215.0 * k) as u8), Stroke::NONE));
+        p.rect_filled(rect, rad, Color32::from_rgba_unmultiplied(30, 38, 62, (215.0 * k) as u8));
     }
     let light = vec2(-0.55, -0.83);
     let bevel = (rad * 0.85).min(rect.height() * 0.4).max(5.0);
@@ -1280,6 +1349,69 @@ fn glass(p: &Painter, rect: Rect, rad: f32, bl: Option<(&TextureHandle, Rect)>, 
         let j = (i + 1) % n;
         let l = (nr[i] + nr[j]).normalized().dot(light);
         let al = ((40.0 + 150.0 * l.max(0.0) + 55.0 * (-l).max(0.0)) * k) as u8;
+        p.line_segment([pts[i], pts[j]], Stroke::new(1.0, Color32::from_white_alpha(al)));
+    }
+}
+
+/// Dark smoked-glass panel (properties modal): dimmed, lightly see-through backdrop, no white bevel glow.
+fn panel(p: &Painter, rect: Rect, rad: f32, bg: Option<(&TextureHandle, Rect)>, full: Rect, k: f32) {
+    for (e, dy, a) in [(24.0_f32, 20.0_f32, 40.0_f32), (10.0, 10.0, 50.0)] {
+        p.rect_filled(rect.expand(e).translate(vec2(0.0, dy)), rad + e, Color32::from_black_alpha((a * k) as u8));
+    }
+    let pts = rounded_pts(rect, rad);
+    match bg {
+        Some((t, uv)) => round_img(
+            p,
+            &pts,
+            t.id(),
+            |pos| {
+                pos2(
+                    uv.min.x + (pos.x - full.min.x) / full.width() * uv.width(),
+                    uv.min.y + (pos.y - full.min.y) / full.height() * uv.height(),
+                )
+            },
+            Color32::from_gray(90).gamma_multiply(k),
+        ),
+        None => fan(p, &pts, |_| Color32::from_rgb(18, 22, 36).gamma_multiply(k)),
+    }
+    fan(p, &pts, |_| Color32::from_rgba_unmultiplied(8, 10, 18, (150.0 * k) as u8));
+    p.add(Shape::closed_line(pts, Stroke::new(1.0, Color32::from_white_alpha((46.0 * k) as u8))));
+}
+
+/// Very soft liquid glass for the nav / info bars: dimmed blurred backdrop, faint milky tint,
+/// gentle top sheen and a light-catching hairline rim. `hot` (0..1) brightens it slightly.
+fn soft_glass(p: &Painter, rect: Rect, rad: f32, bl: Option<(&TextureHandle, Rect)>, full: Rect, k: f32, hot: f32) {
+    for (e, dy, a) in [(18.0_f32, 14.0_f32, 10.0_f32), (8.0, 6.0, 14.0)] {
+        p.rect_filled(rect.expand(e).translate(vec2(0.0, dy)), rad + e, Color32::from_black_alpha((a * k) as u8));
+    }
+    let pts = rounded_pts(rect, rad);
+    match bl {
+        Some((t, uv)) => round_img(
+            p,
+            &pts,
+            t.id(),
+            |pos| {
+                pos2(
+                    uv.min.x + (pos.x - full.min.x) / full.width() * uv.width(),
+                    uv.min.y + (pos.y - full.min.y) / full.height() * uv.height(),
+                )
+            },
+            Color32::from_gray((130.0 + 12.0 * hot) as u8).gamma_multiply(k),
+        ),
+        None => fan(p, &pts, |_| Color32::from_rgba_unmultiplied(34, 42, 70, (150.0 * k) as u8)),
+    }
+    let (top, h) = (rect.top(), rect.height().max(1.0));
+    fan(p, &pts, |pt| {
+        let t = ((pt.y - top) / h).clamp(0.0, 1.0);
+        Color32::from_white_alpha(((10.0 + 8.0 * hot + 22.0 * (1.0 - t) * (1.0 - t)) * k) as u8)
+    });
+    let light = vec2(-0.55, -0.83);
+    let nr = normals(&pts);
+    let n = pts.len();
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let l = (nr[i] + nr[j]).normalized().dot(light);
+        let al = ((24.0 + 10.0 * hot + 70.0 * l.max(0.0) + 24.0 * (-l).max(0.0)) * k) as u8;
         p.line_segment([pts[i], pts[j]], Stroke::new(1.0, Color32::from_white_alpha(al)));
     }
 }
@@ -1405,64 +1537,10 @@ struct Logo {
     mask: TextureHandle, // same shape, white: lets the splash tint refraction fringes
 }
 
-/// Abstract pattern on the right side only: soft discs, drifting rings, dot grid, diagonal hatch.
-fn splash_pattern(p: &Painter, r: Rect, t: f64, a: f32, reduced: bool) {
-    if a <= 0.003 {
-        return;
-    }
-    let (w, h) = (r.width(), r.height());
-    let drift = if reduced { 0.0 } else { t as f32 };
-    let fall = |x: f32| {
-        let u = ((x - (r.left() + w * 0.42)) / (w * 0.58)).clamp(0.0, 1.0);
-        u * u * (3.0 - 2.0 * u)
-    };
-    let disc = |cx: f32, cy: f32, rad: f32, col: Color32, al: f32| p.circle_filled(pos2(cx, cy), rad, col.gamma_multiply(al * a));
-    disc(r.right() - w * 0.10, r.top() + h * 0.22, h * 0.46, Color32::from_rgb(74, 120, 255), 0.55);
-    disc(r.right() - w * 0.02, r.bottom() - h * 0.10, h * 0.55, Color32::from_rgb(26, 56, 186), 0.60);
-    disc(r.right() - w * 0.30, r.bottom() - h * 0.30, h * 0.18, Color32::from_rgb(96, 140, 255), 0.45);
-    // rings
-    let c = pos2(r.right() - w * 0.06, r.center().y);
-    let (step, maxr) = (h * 0.105, w * 0.5);
-    let off = (drift * 9.0) % step;
-    for i in 0..12 {
-        let rad = step * i as f32 + off;
-        if rad < 8.0 || rad > maxr {
-            continue;
-        }
-        let al = (1.0 - rad / maxr).powf(1.4) * 0.30 * a;
-        p.circle_stroke(c, rad, Stroke::new(1.4, Color32::from_white_alpha((al * 255.0) as u8)));
-    }
-    // dot grid
-    let gs = 26.0;
-    let rows = (h / gs) as i32 + 1;
-    let cols = (w * 0.58 / gs) as i32 + 1;
-    for row in 0..rows {
-        for col in 0..cols {
-            let x = r.right() - 14.0 - col as f32 * gs - if row % 2 == 1 { gs * 0.5 } else { 0.0 };
-            let y = r.top() + 10.0 + row as f32 * gs;
-            let al = fall(x) * 0.34 * a;
-            if al > 0.01 {
-                p.circle_filled(pos2(x, y), 1.5, Color32::from_white_alpha((al * 255.0) as u8));
-            }
-        }
-    }
-    // diagonal hatch, lower right
-    let hx = r.right() - w * 0.20;
-    for i in 0..16 {
-        let x0 = hx - i as f32 * 16.0 + (drift * 4.0) % 16.0;
-        let al = fall(x0) * 0.20 * a;
-        if al > 0.01 {
-            let y1 = r.bottom() - 28.0;
-            p.line_segment([pos2(x0, y1), pos2(x0 + 120.0, y1 - 120.0)], Stroke::new(1.2, Color32::from_white_alpha((al * 255.0) as u8)));
-        }
-    }
-}
-
 /// Splash on #2C56E8: glass sphere -> glass tile -> tile dissolves, leaving the logo alone. No text.
 fn splash(p: &Painter, r: Rect, t: f64, logo: Option<&Logo>, reduced: bool) {
     let alive = 1.0 - ease((t - (SPLASH - 0.25)) / 0.25); // exit: everything fades to black (the launcher fades in from black)
     p.rect_filled(r, 0.0, Color32::from_rgb((BLUE.0 as f32 * alive) as u8, (BLUE.1 as f32 * alive) as u8, (BLUE.2 as f32 * alive) as u8));
-    splash_pattern(p, r, t, ease(t / 0.7) * alive, reduced);
     let c = r.center();
     // measured fit: 200px logo (longest side), shrunk when the window is small
     let size = 200.0_f32.min(r.height() * 0.42).min(r.width() * 0.42);
@@ -1567,6 +1645,9 @@ struct App {
     anim: bool,
     logo: Option<Logo>,
     reduced: bool,
+    nav_x: f32,
+    nav_hov: [f32; 3],
+    fav_hov: f32,
 }
 
 impl App {
@@ -1646,6 +1727,9 @@ impl App {
             anim: true,
             logo: load_logo(&cc.egui_ctx),
             reduced: std::env::var_os("LAUNCHER_REDUCE_MOTION").is_some(),
+            nav_x: -1.0,
+            nav_hov: [0.0; 3],
+            fav_hov: 0.0,
         }
     }
 
@@ -2039,10 +2123,53 @@ impl eframe::App for App {
             );
             // search pill
             if self.searching || !self.search.is_empty() {
-                let r = Rect::from_center_size(pos2(full.center().x, full.top() + 45.0), vec2(320.0, 38.0));
-                glass(&p, r, 19.0, bl, full, 1.0);
+                let r = Rect::from_min_size(pos2(left, full.top() + 26.0), vec2(270.0, 38.0));
+                soft_glass(&p, r, 19.0, bl, full, 1.0, 0.0);
                 let cursor = if self.searching { "_" } else { "" };
                 p.text(r.center(), Align2::CENTER_CENTER, format!("Search: {}{}", self.search, cursor), FontId::proportional(16.0), Color32::WHITE);
+            }
+            // ---- top navigation: Home / Favourites / Recent ----
+            {
+                let labels = ["Home", "Favourites", "Recent"];
+                let (iw, ih, pad) = (120.0_f32, 38.0_f32, 5.0_f32);
+                let nav = Rect::from_center_size(pos2(full.center().x, full.top() + 45.0), vec2(iw * 3.0 + pad * 2.0, ih + pad * 2.0));
+                soft_glass(&p, nav, nav.height() / 2.0, bl, full, 1.0, 0.0);
+                if self.nav_x < 0.0 {
+                    self.nav_x = self.tab as f32;
+                }
+                let nd = self.tab as f32 - self.nav_x;
+                if nd.abs() < 0.003 {
+                    self.nav_x = self.tab as f32;
+                } else {
+                    self.nav_x += nd * (1.0 - (-11.0 * dt).exp());
+                    self.anim = true;
+                }
+                let ind = Rect::from_min_size(pos2(nav.min.x + pad + self.nav_x * iw, nav.min.y + pad), vec2(iw, ih));
+                p.rect_filled(ind, ih / 2.0, Color32::from_white_alpha(36));
+                p.rect_stroke(ind, ih / 2.0, Stroke::new(1.0, Color32::from_white_alpha(70)));
+                for i in 0..3 {
+                    let r = Rect::from_min_size(nav.min + vec2(pad + i as f32 * iw, pad), vec2(iw, ih));
+                    let rs = ui.interact(r, Id::new(("nav", i)), sense);
+                    let tgt = if rs.hovered() { 1.0 } else { 0.0 };
+                    let hv = self.nav_hov[i] + (tgt - self.nav_hov[i]) * (1.0 - (-12.0 * dt).exp());
+                    self.nav_hov[i] = hv;
+                    if (tgt - hv).abs() > 0.005 {
+                        self.anim = true;
+                    }
+                    let e = ease(hv as f64);
+                    if e > 0.0 {
+                        p.rect_filled(r, ih / 2.0, Color32::from_white_alpha((20.0 * e) as u8));
+                    }
+                    let act = (1.0 - (self.nav_x - i as f32).abs()).clamp(0.0, 1.0);
+                    let a = (150.0 + 105.0 * act.max(e)) as u8;
+                    p.text(r.center(), Align2::CENTER_CENTER, labels[i], fb(15.0), Color32::from_white_alpha(a));
+                    if rs.clicked() && self.tab != i {
+                        self.tab = i;
+                        self.dirty = true;
+                        self.play(Sfx::Tab);
+                        ctx.request_repaint();
+                    }
+                }
             }
             // now-playing pill
             if running {
@@ -2058,8 +2185,12 @@ impl eframe::App for App {
             if self.view.is_empty() {
                 let m = if self.games.is_empty() {
                     format!("Put games (folders or .zip) in:\n{}", self.dir.display())
-                } else {
+                } else if !self.search.is_empty() {
                     "No games match".to_string()
+                } else if self.tab == 1 {
+                    "No favourites yet - press F on a game to add one".to_string()
+                } else {
+                    "Nothing played yet".to_string()
                 };
                 p.text(full.center(), Align2::CENTER_CENTER, m, FontId::proportional(22.0), Color32::from_white_alpha(180));
                 fade_in(&p, full, t);
@@ -2163,7 +2294,7 @@ impl eframe::App for App {
             let (launches, secs, last) = (st["n"].as_u64().unwrap_or(0), st["secs"].as_u64().unwrap_or(0), st["last"].as_u64().unwrap_or(0));
             let size_s = size.map_or("Calculating…".to_string(), fmt_size);
 
-            let btn_y = full.bottom() - 120.0;
+            let btn_y = full.bottom() - 146.0;
             let desc: String = meta.desc.chars().take(230).collect();
             let gal = p.layout(desc, FontId::proportional(16.0), Color32::from_white_alpha(210), 520.0);
             let desc_h = if meta.desc.is_empty() { 0.0 } else { gal.size().y };
@@ -2198,7 +2329,7 @@ impl eframe::App for App {
             if enabled {
                 p.rect_filled(play.expand(3.0).translate(vec2(0.0, 5.0)), 26.0, Color32::from_black_alpha(60));
             }
-            p.add(Shape::convex_polygon(rounded_pts(play, 23.0), Color32::from_gray(base), Stroke::NONE));
+            p.rect_filled(play, 23.0, Color32::from_gray(base));
             p.text(play.center(), Align2::CENTER_CENTER, label, fb(18.0), Color32::from_gray(20));
             if r1.clicked() {
                 activate = true;
@@ -2207,13 +2338,80 @@ impl eframe::App for App {
             let r2 = ui.interact(more, Id::new("more"), sense);
             glass(&p, more, 23.0, bl, full, 1.0);
             if r2.hovered() {
-                p.add(Shape::convex_polygon(rounded_pts(more, 23.0), Color32::from_white_alpha(40), Stroke::NONE));
+                p.rect_filled(more, 23.0, Color32::from_white_alpha(40));
             }
             for dx in [-8.0_f32, 0.0, 8.0] {
                 p.circle_filled(more.center() + vec2(dx, 0.0), 2.2, Color32::WHITE);
             }
             if r2.clicked() {
                 open_props = true;
+            }
+
+            // ---- bottom info bar: play time, studio, last played, status, favourite ----
+            {
+                let status: (&str, Color32) = match (&kind, has_exe) {
+                    (Kind::Zip, _) => ("Not installed", Color32::from_rgb(240, 200, 70)),
+                    (Kind::Folder, _) if running => ("Running", ACC),
+                    (Kind::Folder, true) => ("Available", Color32::from_rgb(90, 220, 120)),
+                    (Kind::Folder, false) => ("Unavailable", Color32::from_rgb(240, 90, 90)),
+                };
+                let bar = Rect::from_min_max(pos2(full.left() + 56.0, full.bottom() - 80.0), pos2(full.right() - 56.0, full.bottom() - 24.0));
+                soft_glass(&p, bar, 28.0, bl, full, 1.0, 0.0);
+                let favr = Rect::from_center_size(pos2(bar.right() - 16.0 - 100.0, bar.center().y), vec2(200.0, 36.0));
+                let rf = ui.interact(favr, Id::new("favbtn"), sense);
+                let tgt = if rf.hovered() { 1.0 } else { 0.0 };
+                let hv = self.fav_hov + (tgt - self.fav_hov) * (1.0 - (-12.0 * dt).exp());
+                self.fav_hov = hv;
+                if (tgt - hv).abs() > 0.005 {
+                    self.anim = true;
+                }
+                let e = ease(hv as f64);
+                let gold = Color32::from_rgb(255, 196, 60);
+                let (fill, edge) = if is_fav {
+                    (gold.gamma_multiply(0.16 + 0.12 * e), gold.gamma_multiply(0.6 + 0.3 * e))
+                } else {
+                    (Color32::from_white_alpha((14.0 + 34.0 * e) as u8), Color32::from_white_alpha((56.0 + 70.0 * e) as u8))
+                };
+                p.rect_filled(favr, 18.0, fill);
+                p.rect_stroke(favr, 18.0, Stroke::new(1.0, edge));
+                p.circle_filled(pos2(favr.left() + 22.0, favr.center().y), 5.0, if is_fav { gold } else { Color32::from_white_alpha(120) });
+                p.text(
+                    pos2(favr.left() + 38.0, favr.center().y),
+                    Align2::LEFT_CENTER,
+                    if is_fav { "Favourited" } else { "Add to favourites" },
+                    fb(14.0),
+                    Color32::WHITE,
+                );
+                if rf.clicked() {
+                    let nm = name.clone();
+                    if self.prefs.fav.remove(&nm) {
+                        self.play(Sfx::Unfav);
+                    } else {
+                        self.prefs.fav.insert(nm);
+                        self.play(Sfx::Fav);
+                    }
+                    self.prefs.save(&self.prefs_path);
+                    self.dirty = true;
+                    ctx.request_repaint();
+                }
+                let (x0, x1) = (bar.left() + 30.0, favr.left() - 18.0);
+                let fr = [0.0_f32, 0.2, 0.52, 0.76];
+                let cells: [(&str, String); 4] = [
+                    ("PLAY TIME", fmt_time(secs)),
+                    ("STUDIO", trunc(&meta.dev, 24)),
+                    ("LAST PLAYED", fmt_last(last)),
+                    ("STATUS", status.0.to_string()),
+                ];
+                for (i, (lb, v)) in cells.iter().enumerate() {
+                    let cx = x0 + (x1 - x0) * fr[i];
+                    if i > 0 {
+                        p.line_segment([pos2(cx - 14.0, bar.top() + 14.0), pos2(cx - 14.0, bar.bottom() - 14.0)], Stroke::new(1.0, Color32::from_white_alpha(26)));
+                    }
+                    p.text(pos2(cx, bar.top() + 11.0), Align2::LEFT_TOP, *lb, FontId::proportional(11.0), Color32::from_white_alpha(130));
+                    let vx = if i == 3 { cx + 16.0 } else { cx };
+                    p.text(pos2(vx, bar.top() + 26.0), Align2::LEFT_TOP, v, fb(15.0), Color32::WHITE);
+                }
+                p.circle_filled(pos2(x0 + (x1 - x0) * fr[3] + 5.0, bar.top() + 35.0), 4.5, status.1);
             }
 
             // progress + toast
@@ -2239,7 +2437,8 @@ impl eframe::App for App {
                 }
                 p.rect_filled(full, 0.0, Color32::from_black_alpha((150.0 * pm) as u8));
                 let m = Rect::from_center_size(full.center(), vec2(760.0, 470.0));
-                glass(&p, m, 26.0, bl, full, pm);
+                let hl = cur_hero.as_ref().map(|h| (h, cover_uv(h.size_vec2(), full)));
+                panel(&p, m, 26.0, hl, full, pm);
                 let wt = |a: u8| Color32::from_white_alpha((a as f32 * pm) as u8);
                 let pr = Rect::from_min_size(m.min + vec2(30.0, 30.0), vec2(140.0, 210.0));
                 let pp = rounded_pts(pr, 12.0);
@@ -2282,8 +2481,12 @@ impl eframe::App for App {
                     let b = Rect::from_min_size(pos2(x, by), vec2(*w, 42.0));
                     x += *w + 12.0;
                     let rs = ui.interact(b, Id::new(("mb", i)), csense());
-                    let a = if rs.hovered() { 70.0 } else { 36.0 };
-                    p.add(Shape::convex_polygon(rounded_pts(b, 21.0), Color32::from_white_alpha((a * pm) as u8), Stroke::new(1.0, wt(80))));
+                    let (fill, edge) = if rs.hovered() {
+                        (ACC.gamma_multiply(0.9 * pm), wt(230))
+                    } else {
+                        (Color32::from_black_alpha((120.0 * pm) as u8), wt(120))
+                    };
+                    p.rect(b, 21.0, fill, Stroke::new(1.0, edge));
                     p.text(b.center(), Align2::CENTER_CENTER, *txt, fb(14.0), wt(255));
                     clicks[i] = rs.clicked() && self.props;
                 }
