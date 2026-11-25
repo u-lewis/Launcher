@@ -1497,17 +1497,15 @@ fn orb(p: &Painter, rect: Rect, rad: f32, pw: f32, logo: Option<(&Logo, Rect)>, 
     }
 }
 
-const BLUE: (u8, u8, u8) = (0x2C, 0x56, 0xE8);
-
 struct Logo {
     tex: TextureHandle,
     mask: TextureHandle, // same shape, white: lets the splash tint refraction fringes
 }
 
-/// Splash on #2C56E8: glass sphere -> glass tile -> tile dissolves, leaving the logo alone. No text.
+/// Splash on black: glass sphere -> glass tile -> tile dissolves, leaving the logo alone. No text.
 fn splash(p: &Painter, r: Rect, t: f64, logo: Option<&Logo>, reduced: bool) {
     let alive = 1.0 - ease((t - (SPLASH - 0.25)) / 0.25); // exit: everything fades to black (the launcher fades in from black)
-    p.rect_filled(r, 0.0, Color32::from_rgb((BLUE.0 as f32 * alive) as u8, (BLUE.1 as f32 * alive) as u8, (BLUE.2 as f32 * alive) as u8));
+    p.rect_filled(r, 0.0, Color32::BLACK);
     let c = r.center();
     // measured fit: 200px logo (longest side), shrunk when the window is small
     let size = 200.0_f32.min(r.height() * 0.42).min(r.width() * 0.42);
@@ -1548,7 +1546,12 @@ fn splash(p: &Painter, r: Rect, t: f64, logo: Option<&Logo>, reduced: bool) {
 fn load_logo(ctx: &Context) -> Option<Logo> {
     let img = image::load_from_memory(include_bytes!("../assets/logo.png")).ok()?;
     let img = if img.width() > 512 || img.height() > 512 { img.resize(512, 512, image::imageops::FilterType::CatmullRom) } else { img };
-    let rgba = img.to_rgba8();
+    let mut rgba = img.to_rgba8();
+    for px in rgba.pixels_mut() {
+        px.0[0] = 255; // white logo (alpha kept)
+        px.0[1] = 255;
+        px.0[2] = 255;
+    }
     let mut m = rgba.clone();
     for px in m.pixels_mut() {
         px.0[0] = 255;
@@ -1619,6 +1622,9 @@ struct App {
     fav_hov: f32,
     heart: TextureHandle,
     heart_fill: TextureHandle,
+    wave: TextureHandle,
+    wave_hov: f32,
+    was_max: bool,
 }
 
 impl App {
@@ -1630,6 +1636,7 @@ impl App {
         };
         let heart = icon("heart", include_bytes!("../assets/heart.png"));
         let heart_fill = icon("heart_fill", include_bytes!("../assets/heart_fill.png"));
+        let wave = icon("wave", include_bytes!("../assets/wave.png"));
         let mut fonts = FontDefinitions::default();
         fonts.font_data.insert("hg".into(), FontData::from_static(include_bytes!("../assets/HankenGrotesk-Medium.otf")));
         fonts.font_data.insert("hgb".into(), FontData::from_static(include_bytes!("../assets/HankenGrotesk-SemiBold.otf")));
@@ -1712,6 +1719,9 @@ impl App {
             fav_hov: 0.0,
             heart,
             heart_fill,
+            wave,
+            wave_hov: 0.0,
+            was_max: false,
         }
     }
 
@@ -1834,6 +1844,12 @@ impl eframe::App for App {
         let t_abs = ctx.input(|i| i.time);
         let start = *self.start.get_or_insert(t_abs);
         let t = t_abs - start;
+        let maxed = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        if maxed && !self.was_max && !self.fullscreen {
+            self.fullscreen = true;
+            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
+        }
+        self.was_max = maxed;
         let intro = t < SPLASH + 0.65;
         self.anim = intro;
 
@@ -1996,6 +2012,7 @@ impl eframe::App for App {
                     if esc && self.fullscreen {
                         self.fullscreen = false;
                         ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+                        ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
                     }
                 }
                 if a.left {
@@ -2018,6 +2035,9 @@ impl eframe::App for App {
             if f11 {
                 self.fullscreen = !self.fullscreen;
                 ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
+                if !self.fullscreen {
+                    ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
+                }
             }
             if changed {
                 self.dirty = true;
@@ -2390,6 +2410,40 @@ impl eframe::App for App {
                     p.text(pos2(vx, bar.top() + 21.0), Align2::LEFT_TOP, v, fb(13.0), Color32::WHITE);
                 }
                 p.circle_filled(pos2(x0 + (x1 - x0) * fr[3] + 4.0, bar.top() + 29.0), 3.5, status.1);
+
+                // ---- greeting button: same height/radius as the info bar, right edge uses the same 72 px margin as the left column; expands left on hover ----
+                let wb = Rect::from_min_max(pos2(full.right() - 72.0 - bar.height(), bar.top()), pos2(full.right() - 72.0, bar.bottom()));
+                let gal = p.layout_no_wrap("Greetings from Lewis".into(), fb(13.0), Color32::WHITE);
+                let full_w = bar.height() + 24.0 + gal.size().x + 8.0;
+                let wt = if !self.props && ui.rect_contains_pointer(Rect::from_min_max(pos2(wb.right() - self.wave_hov.max(0.0) * (full_w - bar.height()) - bar.height(), wb.top()), wb.right_bottom())) { 1.0 } else { 0.0 };
+                self.wave_hov += (wt - self.wave_hov) * (1.0 - (-12.0 * dt).exp());
+                if (wt - self.wave_hov).abs() > 0.005 || wt > 0.5 {
+                    self.anim = true;
+                }
+                let we = ease(self.wave_hov as f64);
+                let pill = Rect::from_min_max(pos2(wb.right() - bar.height() - (full_w - bar.height()) * we, wb.top()), wb.right_bottom());
+                soft_glass(&p, pill, 22.0, bl, full, 1.0, we);
+                if we > 0.02 {
+                    let a = ((we - 0.4).max(0.0) / 0.6 * 255.0) as u8;
+                    p.text(pos2(pill.left() + 24.0, pill.center().y), Align2::LEFT_CENTER, "Greetings from Lewis", fb(13.0), Color32::from_white_alpha(a));
+                }
+                // hand icon: pivots at the wrist while hovered
+                let ang = if wt > 0.5 { (t_abs as f32 * 9.0).sin() * 0.35 } else { 0.0 } * we;
+                let ic = Rect::from_center_size(wb.center(), vec2(24.0, 24.0));
+                let pv = ic.min + vec2(0.5, 0.85) * ic.size();
+                let (sn, cs) = ang.sin_cos();
+                let rot = |q: Pos2| {
+                    let d = q - pv;
+                    pv + vec2(d.x * cs - d.y * sn, d.x * sn + d.y * cs)
+                };
+                let mut m = Mesh::with_texture(self.wave.id());
+                let tint = Color32::from_white_alpha((190.0 + 65.0 * we) as u8);
+                for (q, uv) in [(ic.left_top(), pos2(0.0, 0.0)), (ic.right_top(), pos2(1.0, 0.0)), (ic.right_bottom(), pos2(1.0, 1.0)), (ic.left_bottom(), pos2(0.0, 1.0))] {
+                    m.vertices.push(Vertex { pos: rot(q), uv, color: tint });
+                }
+                m.add_triangle(0, 1, 2);
+                m.add_triangle(0, 2, 3);
+                p.add(Shape::mesh(m));
             }
 
             // progress + toast
