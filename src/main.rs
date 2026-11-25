@@ -76,6 +76,20 @@ enum Msg {
     Batch(Vec<Msg>), // everything for one game, applied in a single frame
 }
 
+struct ExItem {
+    id: u64,
+    name: String,
+    desc: String,
+    tex: Option<TextureHandle>,
+    hov: f32,
+}
+
+enum ExMsg {
+    List(Vec<(u64, String)>),
+    Card(u64, String, Option<ColorImage>),
+    Done,
+}
+
 #[derive(Default)]
 struct Job {
     progress: f32,
@@ -107,6 +121,8 @@ struct Prefs {
     exe: HashMap<String, String>,
     corner: u8,
     mute: bool,
+    hidden: HashSet<String>,
+    limit: u32, // daily playtime limit in minutes (0 = off)
 }
 
 impl Prefs {
@@ -120,10 +136,12 @@ impl Prefs {
                 .unwrap_or_default(),
             corner: v["corner"].as_u64().unwrap_or(0) as u8,
             mute: v["mute"].as_bool().unwrap_or(false),
+            hidden: v["hidden"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
+            limit: v["limit"].as_u64().unwrap_or(0) as u32,
         }
     }
     fn save(&self, p: &Path) {
-        let _ = fs::write(p, json!({"fav":self.fav,"exe":self.exe,"corner":self.corner,"mute":self.mute}).to_string());
+        let _ = fs::write(p, json!({"fav":self.fav,"exe":self.exe,"corner":self.corner,"mute":self.mute,"hidden":self.hidden,"limit":self.limit}).to_string());
     }
 }
 
@@ -178,6 +196,9 @@ fn fmt_last(ts: u64) -> String {
         return "Never".into();
     }
     chrono::Local.timestamp_opt(ts as i64, 0).single().map(|d| d.format("%b %d, %Y").to_string()).unwrap_or("—".into())
+}
+fn fmt_hm(s: u64) -> String {
+    if s >= 3600 { format!("{}h {:02}m", s / 3600, (s % 3600) / 60) } else { format!("{}m", s / 60) }
 }
 fn dash(s: &str) -> String {
     if s.is_empty() { "—".into() } else { s.to_string() }
@@ -869,7 +890,98 @@ fn stat_add(stats: &Stats, file: &Path, name: &str, secs: u64, launch: bool) {
         e["last"] = json!(now());
     }
     e["secs"] = json!(e["secs"].as_u64().unwrap_or(0) + secs);
+    if secs > 0 {
+        // proof of play: per-day totals and a log of the last 40 recorded sessions (start time + length)
+        let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let cur = e["days"][day.as_str()].as_u64().unwrap_or(0);
+        e["days"][day.as_str()] = json!(cur + secs);
+        let mut ss = e["sess"].as_array().cloned().unwrap_or_default();
+        ss.push(json!({"t": now().saturating_sub(secs), "s": secs}));
+        if ss.len() > 40 {
+            let n = ss.len() - 40;
+            ss.drain(..n);
+        }
+        e["sess"] = json!(ss);
+    }
     let _ = fs::write(file, serde_json::to_string(&*m).unwrap_or_default());
+}
+
+// ---------- explore (store catalogue; own cache dir, never touches the library cache) ----------
+/// Ranked list of most played games, cached for 3 days (stale copy used when offline).
+fn explore_ranked(dir: &Path) -> Vec<(u64, String)> {
+    let f = dir.join("top.json");
+    let cached = || fs::read_to_string(&f).ok().and_then(|s| serde_json::from_str::<Vec<(u64, String)>>(&s).ok()).filter(|v| !v.is_empty());
+    let fresh = fs::metadata(&f).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map_or(false, |e| e.as_secs() < 3 * 86_400);
+    if fresh {
+        if let Some(v) = cached() {
+            return v;
+        }
+    }
+    let net = || -> Option<Vec<(u64, String)>> {
+        let v: Value = serde_json::from_slice(&http_get("https://steamspy.com/api.php?request=top100in2weeks")?).ok()?;
+        let mut a: Vec<(u64, String, u64)> = v
+            .as_object()?
+            .iter()
+            .filter_map(|(k, x)| Some((k.parse().ok()?, x["name"].as_str()?.to_string(), x["average_2weeks"].as_u64().unwrap_or(0))))
+            .collect();
+        a.sort_by_key(|x| std::cmp::Reverse(x.2));
+        let out: Vec<(u64, String)> = a.into_iter().map(|(i, n, _)| (i, n)).collect();
+        if out.is_empty() { None } else { Some(out) }
+    };
+    let alt = || -> Option<Vec<(u64, String)>> {
+        let v: Value = serde_json::from_slice(&http_get("https://store.steampowered.com/search/results/?query&start=0&count=50&filter=topsellers&json=1&cc=US&l=english")?).ok()?;
+        let out: Vec<(u64, String)> = v["items"]
+            .as_array()?
+            .iter()
+            .filter_map(|i| {
+                let id = i["logo"].as_str()?.split("/apps/").nth(1)?.split('/').next()?.parse().ok()?;
+                Some((id, i["name"].as_str()?.to_string()))
+            })
+            .collect();
+        if out.is_empty() { None } else { Some(out) }
+    };
+    if let Some(v) = net().or_else(alt) {
+        let _ = fs::write(&f, serde_json::to_string(&v).unwrap_or_default());
+        return v;
+    }
+    cached().unwrap_or_default()
+}
+/// Loads one page (10 games): list first, then each game's description + poster, every one cached on disk.
+fn explore_page(dir: PathBuf, page: usize, tx: mpsc::Sender<ExMsg>, ctx: Context) {
+    thread::spawn(move || {
+        let _ = fs::create_dir_all(&dir);
+        let items: Vec<(u64, String)> = explore_ranked(&dir).into_iter().skip(page * 10).take(10).collect();
+        let _ = tx.send(ExMsg::List(items.clone()));
+        ctx.request_repaint();
+        for (id, _) in items {
+            let d = dir.join(id.to_string());
+            let _ = fs::create_dir_all(&d);
+            let df = d.join("desc.txt");
+            let mut desc = fs::read_to_string(&df).unwrap_or_default();
+            if desc.is_empty() {
+                desc = fetch_details(id).desc;
+                if !desc.is_empty() {
+                    let _ = fs::write(&df, &desc);
+                }
+            }
+            let urls: Vec<String> = BASES
+                .iter()
+                .map(|b| format!("{b}/{id}/library_600x900.jpg"))
+                .chain(BASES.iter().map(|b| format!("{b}/{id}/header.jpg")))
+                .collect();
+            let img = find_or_get(&[], &d.join("poster.img"), &urls)
+                .and_then(|p| image::ImageReader::open(p).ok()?.with_guessed_format().ok()?.decode().ok())
+                .map(|im| {
+                    use image::imageops::FilterType::Triangle;
+                    let im = if im.width() > im.height() { im.resize(460, 460, Triangle) } else { im.resize_to_fill(300, 450, Triangle) };
+                    ci(&im.to_rgba8())
+                });
+            let _ = tx.send(ExMsg::Card(id, desc, img));
+            ctx.request_repaint();
+        }
+        let _ = tx.send(ExMsg::Done);
+        ctx.request_repaint();
+    });
 }
 
 // ---------- gamepad (polled on its own thread, paused while gaming) ----------
@@ -1314,6 +1426,33 @@ fn cover_uv(ts: Vec2, full: Rect) -> Rect {
     }
 }
 
+fn draw_poster(p: &Painter, r: Rect, rad: f32, tx: &TextureHandle, tint: Color32) {
+    let u = cover_uv(tx.size_vec2(), r);
+    round_img(
+        p,
+        &rounded_pts(r, rad),
+        tx.id(),
+        |pt| pos2(u.min.x + (pt.x - r.min.x) / r.width() * u.width(), u.min.y + (pt.y - r.min.y) / r.height() * u.height()),
+        tint,
+    );
+}
+
+fn icon_rot(p: &Painter, tex: TextureId, r: Rect, ang: f32, tint: Color32) {
+    let (sn, cs) = ang.sin_cos();
+    let c = r.center();
+    let rot = |q: Pos2| {
+        let d = q - c;
+        c + vec2(d.x * cs - d.y * sn, d.x * sn + d.y * cs)
+    };
+    let mut m = Mesh::with_texture(tex);
+    for (q, uv) in [(r.left_top(), pos2(0.0, 0.0)), (r.right_top(), pos2(1.0, 0.0)), (r.right_bottom(), pos2(1.0, 1.0)), (r.left_bottom(), pos2(0.0, 1.0))] {
+        m.vertices.push(Vertex { pos: rot(q), uv, color: tint });
+    }
+    m.add_triangle(0, 1, 2);
+    m.add_triangle(0, 2, 3);
+    p.add(Shape::mesh(m));
+}
+
 fn uv_full() -> Rect {
     Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0))
 }
@@ -1625,6 +1764,22 @@ struct App {
     wave: TextureHandle,
     wave_hov: f32,
     was_max: bool,
+    settings_tex: TextureHandle,
+    settings: bool,
+    sm: f32,
+    page: u8,
+    set_hov: f32,
+    hid_scroll: f32,
+    limit_warned: bool,
+    ex_dir: PathBuf,
+    ex_tx: mpsc::Sender<ExMsg>,
+    ex_rx: mpsc::Receiver<ExMsg>,
+    ex_items: Vec<ExItem>,
+    ex_page: usize,
+    ex_loading: bool,
+    ex_more: bool,
+    ex_err: bool,
+    ex_scroll: f32,
 }
 
 impl App {
@@ -1637,6 +1792,7 @@ impl App {
         let heart = icon("heart", include_bytes!("../assets/heart.png"));
         let heart_fill = icon("heart_fill", include_bytes!("../assets/heart_fill.png"));
         let wave = icon("wave", include_bytes!("../assets/wave.png"));
+        let settings_tex = icon("settings", include_bytes!("../assets/settings.png"));
         let mut fonts = FontDefinitions::default();
         fonts.font_data.insert("hg".into(), FontData::from_static(include_bytes!("../assets/HankenGrotesk-Medium.otf")));
         fonts.font_data.insert("hgb".into(), FontData::from_static(include_bytes!("../assets/HankenGrotesk-SemiBold.otf")));
@@ -1648,6 +1804,8 @@ impl App {
         fonts.families.insert(FontFamily::Name("bold".into()), bold);
         cc.egui_ctx.set_fonts(fonts);
         let cache = dir.join(".cache");
+        let ex_dir = dir.join(".explore_cache");
+        let (ex_tx, ex_rx) = mpsc::channel();
         let _ = fs::create_dir_all(&cache);
         let prefs_path = cache.join("prefs.json");
         let prefs = Prefs::load(&prefs_path);
@@ -1722,6 +1880,22 @@ impl App {
             wave,
             wave_hov: 0.0,
             was_max: false,
+            settings_tex,
+            settings: false,
+            sm: 0.0,
+            page: 0,
+            set_hov: 0.0,
+            hid_scroll: 0.0,
+            limit_warned: false,
+            ex_dir,
+            ex_tx,
+            ex_rx,
+            ex_items: vec![],
+            ex_page: 0,
+            ex_loading: false,
+            ex_more: true,
+            ex_err: false,
+            ex_scroll: 0.0,
         }
     }
 
@@ -1741,7 +1915,8 @@ impl App {
         let mut v: Vec<usize> = (0..self.games.len())
             .filter(|&i| {
                 let g = &self.games[i];
-                (q.is_empty() || g.name.to_lowercase().contains(&q))
+                !self.prefs.hidden.contains(&g.name)
+                    && (q.is_empty() || g.name.to_lowercase().contains(&q))
                     && match self.tab {
                         1 => self.prefs.fav.contains(&g.name),
                         2 => self.last_of(&g.name) > 0,
@@ -1758,6 +1933,376 @@ impl App {
             .unwrap_or(0)
             .min(self.view.len().saturating_sub(1));
         self.dirty = false;
+    }
+
+    fn stat_days(&self, day: &str) -> u64 {
+        self.stats.lock().unwrap().values().map(|e| e["days"][day].as_u64().unwrap_or(0)).sum()
+    }
+
+    /// Recorded playtime today (finished sessions + the running one).
+    fn played_today(&self) -> u64 {
+        let live = {
+            let m = self.mon.lock().unwrap();
+            if m.running { m.uptime } else { 0 }
+        };
+        self.stat_days(&chrono::Local::now().format("%Y-%m-%d").to_string()) + live
+    }
+
+    fn settings_back(&mut self) {
+        if self.page > 0 {
+            self.page = 0;
+            self.play(Sfx::Back);
+        } else {
+            self.settings = false;
+            self.play(Sfx::Close);
+        }
+    }
+
+    fn explore_load(&mut self, ctx: &Context) {
+        if self.ex_loading {
+            return;
+        }
+        self.ex_loading = true;
+        self.ex_err = false;
+        explore_page(self.ex_dir.clone(), self.ex_page, self.ex_tx.clone(), ctx.clone());
+        self.ex_page += 1;
+    }
+
+    /// Top bar: clock + settings button (top right, mirrors the 24 px margin of the nav pill); back pill while settings are open.
+    fn header_ui(&mut self, ctx: &Context, ui: &mut Ui, p: &Painter, full: Rect, bl: Option<(&TextureHandle, Rect)>, dt: f32, _t: f64) {
+        let ha = 1.0 - 0.55 * self.pm;
+        let cy = full.top() + 45.0;
+        let k = ease(self.sm as f64);
+        let sb = Rect::from_center_size(pos2(full.right() - 24.0 - 19.0, cy), vec2(38.0, 38.0));
+        let sense = if self.props || self.ask { Sense::hover() } else { csense() };
+        let rs = ui.interact(sb, Id::new("settings_btn"), sense);
+        let tgt = if rs.hovered() { 1.0 } else { 0.0 };
+        self.set_hov += (tgt - self.set_hov) * (1.0 - (-12.0 * dt).exp());
+        if (tgt - self.set_hov).abs() > 0.005 {
+            self.anim = true;
+        }
+        let e = ease(self.set_hov as f64);
+        p.text(pos2(sb.left() - 14.0, cy), Align2::RIGHT_CENTER, chrono::Local::now().format("%H:%M").to_string(), fb(15.0), Color32::from_white_alpha((210.0 * ha) as u8));
+        soft_glass(p, sb, 19.0, bl, full, ha, 0.0);
+        let hl = (28.0 * k + 10.0 * e * (1.0 - k)) * ha;
+        if hl >= 1.0 {
+            rr(p, sb, 19.0, Color32::from_white_alpha(hl as u8), None);
+        }
+        let ic = Rect::from_center_size(sb.center(), vec2(20.0, 20.0));
+        icon_rot(p, self.settings_tex.id(), ic, 1.05 * (0.5 * e + 0.5 * k), Color32::from_white_alpha(((190.0 + 65.0 * e.max(k)) * ha) as u8));
+        if rs.clicked() {
+            self.settings = !self.settings;
+            self.page = 0;
+            self.play(if self.settings { Sfx::Open } else { Sfx::Close });
+            if self.settings && self.ex_items.is_empty() {
+                self.explore_load(ctx);
+            }
+            ctx.request_repaint();
+        }
+        if self.sm > 0.01 {
+            let bp = Rect::from_min_size(pos2(full.left() + 24.0, cy - 19.0), vec2(96.0, 38.0));
+            soft_glass(p, bp, 19.0, bl, full, k, 0.0);
+            let rb = ui.interact(bp, Id::new("set_back"), if self.settings && k > 0.95 { csense() } else { Sense::hover() });
+            if rb.hovered() {
+                rr(p, bp, 19.0, Color32::from_white_alpha((10.0 * k) as u8), None);
+            }
+            let cx = bp.left() + 26.0;
+            let st = Stroke::new(2.0, Color32::from_white_alpha((220.0 * k) as u8));
+            p.line_segment([pos2(cx + 3.0, cy - 5.0), pos2(cx - 2.0, cy)], st);
+            p.line_segment([pos2(cx - 2.0, cy), pos2(cx + 3.0, cy + 5.0)], st);
+            p.text(pos2(bp.left() + 40.0, cy), Align2::LEFT_CENTER, "Back", fb(14.0), Color32::from_white_alpha((235.0 * k) as u8));
+            p.text(
+                pos2(bp.right() + 16.0, cy),
+                Align2::LEFT_CENTER,
+                if self.page == 0 { "Settings" } else { "Explore games" },
+                fb(16.0),
+                Color32::from_white_alpha((235.0 * k) as u8),
+            );
+            if rb.clicked() && self.settings {
+                self.settings_back();
+            }
+        }
+    }
+
+    /// Settings: bento grid (most played, playtime limit, hidden games, explore) + explore page.
+    fn settings_ui(&mut self, ctx: &Context, ui: &mut Ui, p: &Painter, full: Rect, bl: Option<(&TextureHandle, Rect)>, dt: f32) {
+        let k = ease(self.sm as f64);
+        let live = self.settings && k > 0.95;
+        let sense = if live { csense() } else { Sense::hover() };
+        let a = (255.0 * k) as u8;
+        p.rect_filled(full, 0.0, Color32::from_black_alpha(a));
+        grad(p, full, Color32::from_rgba_unmultiplied(7, 10, 24, a), Color32::from_rgba_unmultiplied(18, 30, 66, a), false);
+        let (left, right) = (full.left() + 72.0, full.right() - 72.0);
+        let area = Rect::from_min_max(pos2(left, full.top() + 88.0), pos2(right, full.bottom() - 24.0));
+        let g = 14.0_f32;
+        let wa = |v: f32| Color32::from_white_alpha((v * k) as u8);
+        let ptr = ctx.input(|i| i.pointer.hover_pos());
+        let wheel = ctx.input(|i| i.smooth_scroll_delta.y);
+        let lab = FontId::proportional(9.5);
+
+        if self.page == 0 {
+            let cw = (area.width() - 2.0 * g) / 3.0;
+            let rh = (area.height() - g) / 2.0;
+            let col = |c: f32| area.left() + c * (cw + g);
+            let t1 = Rect::from_min_size(pos2(col(0.0), area.top()), vec2(cw, area.height()));
+            let t2 = Rect::from_min_size(pos2(col(1.0), area.top()), vec2(cw * 2.0 + g, rh));
+            let t3 = Rect::from_min_size(pos2(col(1.0), area.top() + rh + g), vec2(cw, rh));
+            let t4 = Rect::from_min_size(pos2(col(2.0), area.top() + rh + g), vec2(cw, rh));
+            for t in [t1, t2, t3, t4] {
+                soft_glass(p, t, 26.0, bl, full, k, 0.0);
+            }
+
+            // ---- most played (from recorded sessions) ----
+            let mut rank: Vec<(String, u64, usize, u64, u64)> = vec![];
+            {
+                let st = self.stats.lock().unwrap();
+                for gm in &self.games {
+                    if let Some(e) = st.get(&gm.name) {
+                        let secs = e["secs"].as_u64().unwrap_or(0);
+                        if secs >= 60 {
+                            let ss = e["sess"].as_array();
+                            let (lt, ld) = ss.and_then(|v| v.last()).map_or((0, 0), |x| (x["t"].as_u64().unwrap_or(0), x["s"].as_u64().unwrap_or(0)));
+                            rank.push((gm.name.clone(), secs, ss.map_or(0, |v| v.len()), lt, ld));
+                        }
+                    }
+                }
+            }
+            rank.sort_by_key(|r| std::cmp::Reverse(r.1));
+            rank.truncate(5);
+            p.text(pos2(t1.left() + 24.0, t1.top() + 22.0), Align2::LEFT_TOP, "MOST PLAYED", lab.clone(), wa(130.0));
+            p.text(pos2(t1.right() - 24.0, t1.top() + 22.0), Align2::RIGHT_TOP, "RECORDED BY LAUNCHER", lab.clone(), wa(90.0));
+            if rank.is_empty() {
+                p.text(t1.center(), Align2::CENTER_CENTER, "Nothing recorded yet", FontId::proportional(14.0), wa(150.0));
+            }
+            let top_s = rank.first().map_or(1, |r| r.1).max(1);
+            let row_h = (t1.height() - 52.0 - 16.0) / 5.0;
+            for (i, (name, secs, n, lt, ld)) in rank.iter().enumerate() {
+                let y = t1.top() + 52.0 + i as f32 * row_h;
+                let th = Rect::from_min_size(pos2(t1.left() + 24.0, y + 4.0), vec2(56.0, 84.0));
+                match self.assets.get(name).and_then(|a| a.poster_s.clone().or(a.poster.clone())) {
+                    Some(tx) => draw_poster(p, th, 10.0, &tx, Color32::WHITE.gamma_multiply(k)),
+                    None => fan(p, &rounded_pts(th, 10.0), |_| tint(name).gamma_multiply(0.7 * k)),
+                }
+                let tx0 = th.right() + 16.0;
+                let tw = t1.right() - 24.0 - tx0;
+                p.text(pos2(tx0, y + 8.0), Align2::LEFT_TOP, trunc(name, 18), fb(14.0), wa(255.0));
+                p.text(pos2(tx0, y + 28.0), Align2::LEFT_TOP, fmt_hm(*secs), fb(20.0), wa(255.0));
+                let tr = Rect::from_min_size(pos2(tx0, y + 62.0), vec2(tw, 6.0));
+                rr(p, tr, 3.0, wa(40.0), None);
+                rr(p, Rect::from_min_size(tr.min, vec2((tw * *secs as f32 / top_s as f32).max(6.0), 6.0)), 3.0, ACC.gamma_multiply(k), None);
+                let proof = if *n > 0 { format!("{} sessions · {} · {}", n, fmt_last(*lt), fmt_hm(*ld)) } else { "total tracked by launcher".to_string() };
+                p.text(pos2(tx0, y + 74.0), Align2::LEFT_TOP, trunc(&proof, 34), FontId::proportional(10.5), wa(130.0));
+            }
+
+            // ---- playtime limit ----
+            let today_s = self.played_today();
+            let lim = self.prefs.limit as u64 * 60;
+            p.text(pos2(t2.left() + 24.0, t2.top() + 22.0), Align2::LEFT_TOP, "PLAYTIME LIMIT", lab.clone(), wa(130.0));
+            p.text(pos2(t2.left() + 24.0, t2.top() + 44.0), Align2::LEFT_TOP, fmt_hm(today_s), fb(34.0), wa(255.0));
+            let cap = if lim > 0 { format!("played today · limit {}", fmt_hm(lim)) } else { "played today · no limit set".to_string() };
+            p.text(pos2(t2.left() + 24.0, t2.top() + 88.0), Align2::LEFT_TOP, cap, FontId::proportional(12.5), wa(150.0));
+            let sy = t2.top() + 44.0;
+            let plus = Rect::from_min_size(pos2(t2.right() - 24.0 - 34.0, sy), vec2(34.0, 34.0));
+            let val = Rect::from_min_size(pos2(plus.left() - 14.0 - 72.0, sy), vec2(72.0, 34.0));
+            let minus = Rect::from_min_size(pos2(val.left() - 14.0 - 34.0, sy), vec2(34.0, 34.0));
+            let mut dlim = 0i32;
+            for (r, id, d) in [(minus, "lim_m", -30), (plus, "lim_p", 30)] {
+                let rs = ui.interact(r, Id::new(id), sense);
+                rr(p, r, 17.0, Color32::from_white_alpha(((if rs.hovered() { 32.0 } else { 10.0 }) * k) as u8), None);
+                let st = Stroke::new(2.0, wa(230.0));
+                p.line_segment([r.center() - vec2(6.0, 0.0), r.center() + vec2(6.0, 0.0)], st);
+                if d > 0 {
+                    p.line_segment([r.center() - vec2(0.0, 6.0), r.center() + vec2(0.0, 6.0)], st);
+                }
+                if rs.clicked() {
+                    dlim = d;
+                }
+            }
+            p.text(val.center(), Align2::CENTER_CENTER, if lim == 0 { "Off".to_string() } else { fmt_hm(lim) }, fb(15.0), wa(255.0));
+            if dlim != 0 {
+                self.prefs.limit = (self.prefs.limit as i32 + dlim).clamp(0, 720) as u32;
+                self.prefs.save(&self.prefs_path);
+                self.play(Sfx::Tab);
+            }
+            let tr = Rect::from_min_size(pos2(t2.left() + 24.0, t2.top() + 120.0), vec2(t2.width() - 48.0, 8.0));
+            rr(p, tr, 4.0, wa(40.0), None);
+            if lim > 0 {
+                let fr = (today_s as f32 / lim as f32).min(1.0);
+                let c = if fr >= 1.0 { Color32::from_rgb(240, 90, 90) } else { ACC };
+                rr(p, Rect::from_min_size(tr.min, vec2((tr.width() * fr).max(8.0), 8.0)), 4.0, c.gamma_multiply(k), None);
+            }
+            // last 7 days
+            let mut days: Vec<(String, u64)> = vec![];
+            for d in (0..7).rev() {
+                let day = chrono::Local::now() - chrono::Duration::days(d);
+                let s = if d == 0 { today_s } else { self.stat_days(&day.format("%Y-%m-%d").to_string()) };
+                days.push((day.format("%a").to_string(), s));
+            }
+            let mx = days.iter().map(|d| d.1).max().unwrap_or(0).max(3600) as f32;
+            let (cy0, cy1) = (t2.top() + 150.0, t2.bottom() - 40.0);
+            let slot = (t2.width() - 48.0) / 7.0;
+            for (i, (lb, s)) in days.iter().enumerate() {
+                let cx = t2.left() + 24.0 + slot * (i as f32 + 0.5);
+                let h = ((cy1 - cy0) * *s as f32 / mx).max(3.0);
+                let br = Rect::from_min_max(pos2(cx - 14.0, cy1 - h), pos2(cx + 14.0, cy1));
+                let now_b = i == 6;
+                rr(p, br, 8.0_f32.min(h / 2.0), if now_b { ACC.gamma_multiply(k) } else { wa(55.0) }, None);
+                if *s >= 60 {
+                    p.text(pos2(cx, br.top() - 4.0), Align2::CENTER_BOTTOM, fmt_hm(*s), lab.clone(), wa(150.0));
+                }
+                p.text(pos2(cx, cy1 + 8.0), Align2::CENTER_TOP, lb, lab.clone(), wa(if now_b { 230.0 } else { 130.0 }));
+            }
+
+            // ---- hidden games ----
+            let names: Vec<String> = self.games.iter().map(|g| g.name.clone()).collect();
+            let nhid = names.iter().filter(|n| self.prefs.hidden.contains(*n)).count();
+            p.text(pos2(t3.left() + 24.0, t3.top() + 22.0), Align2::LEFT_TOP, "HIDDEN GAMES", lab.clone(), wa(130.0));
+            p.text(pos2(t3.right() - 24.0, t3.top() + 22.0), Align2::RIGHT_TOP, format!("{nhid} HIDDEN"), lab.clone(), wa(90.0));
+            let list = Rect::from_min_max(pos2(t3.left() + 24.0, t3.top() + 48.0), pos2(t3.right() - 24.0, t3.bottom() - 16.0));
+            let row_h3 = 36.0_f32;
+            let total = names.len() as f32 * row_h3;
+            if live && ptr.map_or(false, |q| t3.contains(q)) {
+                self.hid_scroll -= wheel;
+            }
+            self.hid_scroll = self.hid_scroll.clamp(0.0, (total - list.height()).max(0.0));
+            let pc = p.with_clip_rect(list);
+            let mut toggle: Option<String> = None;
+            if names.is_empty() {
+                p.text(list.center(), Align2::CENTER_CENTER, "No games yet", FontId::proportional(14.0), wa(150.0));
+            }
+            for (i, nm) in names.iter().enumerate() {
+                let r = Rect::from_min_size(pos2(list.left(), list.top() + i as f32 * row_h3 - self.hid_scroll), vec2(list.width(), row_h3 - 4.0));
+                let vis = r.intersect(list);
+                if vis.height() < 4.0 {
+                    continue;
+                }
+                let hid = self.prefs.hidden.contains(nm);
+                let rs = ui.interact(vis, Id::new(("hid", i)), sense);
+                if rs.hovered() {
+                    rr(&pc, r, 12.0, Color32::from_white_alpha((10.0 * k) as u8), None);
+                }
+                pc.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, trunc(nm, 20), fb(13.0), wa(if hid { 120.0 } else { 235.0 }));
+                let pill = Rect::from_center_size(pos2(r.right() - 10.0 - 30.0, r.center().y), vec2(60.0, 24.0));
+                rr(&pc, pill, 12.0, if hid { ACC.gamma_multiply(0.85 * k) } else { wa(16.0) }, None);
+                pc.text(pill.center(), Align2::CENTER_CENTER, if hid { "Hidden" } else { "Hide" }, FontId::proportional(11.0), wa(if hid { 255.0 } else { 170.0 }));
+                if rs.clicked() {
+                    toggle = Some(nm.clone());
+                }
+            }
+            if let Some(nm) = toggle {
+                if !self.prefs.hidden.remove(&nm) {
+                    self.prefs.hidden.insert(nm);
+                }
+                self.prefs.save(&self.prefs_path);
+                self.dirty = true;
+                self.play(Sfx::Select);
+            }
+
+            // ---- explore tile ----
+            let r4 = ui.interact(t4, Id::new("explore_tile"), sense);
+            if r4.hovered() {
+                rr(p, t4, 26.0, Color32::from_white_alpha((10.0 * k) as u8), None);
+            }
+            p.text(pos2(t4.left() + 24.0, t4.top() + 22.0), Align2::LEFT_TOP, "EXPLORE GAMES", lab.clone(), wa(130.0));
+            let pw = (t4.width() - 48.0 - 20.0) / 3.0;
+            let ph = pw * 1.5;
+            for i in 0..3 {
+                let r = Rect::from_min_size(pos2(t4.left() + 24.0 + i as f32 * (pw + 10.0), t4.top() + 46.0), vec2(pw, ph));
+                match self.ex_items.get(i).and_then(|e| e.tex.clone()) {
+                    Some(tx) => draw_poster(p, r, 10.0, &tx, Color32::WHITE.gamma_multiply(k)),
+                    None => rr(p, r, 10.0, wa(18.0), None),
+                }
+            }
+            p.text(pos2(t4.left() + 24.0, t4.top() + 46.0 + ph + 14.0), Align2::LEFT_TOP, "Top games right now", fb(14.0), wa(255.0));
+            p.text(pos2(t4.left() + 24.0, t4.top() + 46.0 + ph + 34.0), Align2::LEFT_TOP, "Hover a game to read about it", FontId::proportional(11.5), wa(130.0));
+            if r4.clicked() {
+                self.page = 1;
+                self.ex_scroll = 0.0;
+                self.play(Sfx::Open);
+                if self.ex_items.is_empty() {
+                    self.explore_load(ctx);
+                }
+            }
+        } else {
+            // ---- explore page: 10 games, "Load more" adds 10; every poster + description cached in its own dir ----
+            p.text(pos2(left, area.top()), Align2::LEFT_TOP, "TOP PLAYED THIS FORTNIGHT  ·  BROWSE ONLY, NO DOWNLOADS", lab.clone(), wa(130.0));
+            let gr = Rect::from_min_max(pos2(left, area.top() + 22.0), area.max);
+            let cols = 5usize;
+            let cw = (gr.width() - (cols as f32 - 1.0) * g) / cols as f32;
+            let ch = cw * 1.5;
+            let n = self.ex_items.len();
+            let rows = (n + cols - 1) / cols;
+            let show_more = n > 0 && self.ex_more;
+            let total = rows as f32 * (ch + g) + if show_more { 46.0 + g } else { 0.0 };
+            if live && ptr.map_or(false, |q| gr.contains(q)) {
+                self.ex_scroll -= wheel;
+            }
+            self.ex_scroll = self.ex_scroll.clamp(0.0, (total - gr.height()).max(0.0));
+            let sc = self.ex_scroll;
+            let pc = p.with_clip_rect(gr);
+            if n == 0 {
+                let m = if self.ex_loading { "Loading games…" } else { "Couldn't reach the store - cached games show up here when available" };
+                p.text(gr.center(), Align2::CENTER_CENTER, m, FontId::proportional(18.0), wa(180.0));
+            }
+            let mut animating = false;
+            for (i, it) in self.ex_items.iter_mut().enumerate() {
+                let rect = Rect::from_min_size(pos2(gr.left() + (i % cols) as f32 * (cw + g), gr.top() + (i / cols) as f32 * (ch + g) - sc), vec2(cw, ch));
+                let vis = rect.intersect(gr);
+                if vis.height() < 2.0 {
+                    continue;
+                }
+                let hov = live && ui.interact(vis, Id::new(("ex", i)), Sense::hover()).hovered();
+                let tg = if hov { 1.0 } else { 0.0 };
+                it.hov += (tg - it.hov) * (1.0 - (-12.0 * dt).exp());
+                if (tg - it.hov).abs() > 0.005 {
+                    animating = true;
+                }
+                let e = ease(it.hov as f64);
+                shadow(&pc, rect, 14.0, 22.0, 8.0, (50.0 + 50.0 * e) * k);
+                match &it.tex {
+                    Some(tx) => draw_poster(&pc, rect, 14.0, tx, Color32::from_gray((235.0 - 150.0 * e) as u8).gamma_multiply(k)),
+                    None => {
+                        let (c0, ry) = (tint(&it.name).gamma_multiply(0.7 * k), rect.top());
+                        let c1 = c0.gamma_multiply(0.4);
+                        fan(&pc, &rounded_pts(rect, 14.0), |pt| c0.lerp_to_gamma(c1, ((pt.y - ry) / ch).clamp(0.0, 1.0)));
+                        let ch0 = it.name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+                        pc.text(rect.center(), Align2::CENTER_CENTER, ch0, fb(cw * 0.42), wa(200.0));
+                    }
+                }
+                if e > 0.02 {
+                    let cl = p.with_clip_rect(vis);
+                    let ng = cl.layout(it.name.clone(), fb(15.0), Color32::from_white_alpha((255.0 * e * k) as u8), cw - 28.0);
+                    let nh = ng.size().y;
+                    cl.galley(pos2(rect.left() + 14.0, rect.top() + 14.0), ng, Color32::WHITE);
+                    let d: String = if it.desc.is_empty() { "No description available yet.".into() } else { it.desc.chars().take(220).collect() };
+                    let dg = cl.layout(d, FontId::proportional(12.0), Color32::from_white_alpha((205.0 * e * k) as u8), cw - 28.0);
+                    cl.galley(pos2(rect.left() + 14.0, rect.top() + 14.0 + nh + 8.0), dg, Color32::WHITE);
+                    rim(&pc, &rounded_pts(rect.expand(5.0 * e), 14.0 + 5.0 * e), 2.5, |_| ACC.gamma_multiply(e * k));
+                }
+            }
+            if animating {
+                self.anim = true;
+            }
+            if show_more {
+                let y = gr.top() + rows as f32 * (ch + g) - sc;
+                let btn = Rect::from_center_size(pos2(gr.center().x, y + 23.0), vec2(168.0, 46.0));
+                let vis = btn.intersect(gr);
+                if vis.height() > 2.0 {
+                    let enabled = !self.ex_loading;
+                    let rs = ui.interact(vis, Id::new("ex_more"), sense);
+                    if enabled {
+                        shadow(&pc, btn, 23.0, 24.0, 10.0, 90.0 * k);
+                    }
+                    let pf = if !enabled { wa(22.0) } else if rs.hovered() { Color32::from_rgb(52, 152, 255).gamma_multiply(k) } else { ACC.gamma_multiply(k) };
+                    rr(&pc, btn, 23.0, pf, None);
+                    pc.text(btn.center(), Align2::CENTER_CENTER, if enabled { "Load more" } else { "Loading…" }, fb(17.0), wa(if enabled { 255.0 } else { 110.0 }));
+                    if rs.clicked() && enabled {
+                        self.play(Sfx::Select);
+                        self.explore_load(ctx);
+                    }
+                }
+            }
+        }
     }
 
     fn start_install(&mut self, ctx: &Context) {
@@ -1789,6 +2334,11 @@ impl App {
             Kind::Folder => {
                 if self.mon.lock().unwrap().running {
                     self.msg = Some(("A game is already running".into(), t));
+                    self.play(Sfx::Error);
+                    return;
+                }
+                if self.prefs.limit > 0 && self.played_today() >= self.prefs.limit as u64 * 60 {
+                    self.msg = Some((format!("Daily limit of {} reached", fmt_hm(self.prefs.limit as u64 * 60)), t));
                     self.play(Sfx::Error);
                     return;
                 }
@@ -1853,6 +2403,32 @@ impl eframe::App for App {
         let intro = t < SPLASH + 0.65;
         self.anim = intro;
 
+        while let Ok(m) = self.ex_rx.try_recv() {
+            match m {
+                ExMsg::List(v) => {
+                    self.ex_more = v.len() >= 10;
+                    if v.is_empty() {
+                        self.ex_err = true;
+                        self.ex_page = self.ex_page.saturating_sub(1);
+                    }
+                    for (id, name) in v {
+                        if !self.ex_items.iter().any(|e| e.id == id) {
+                            self.ex_items.push(ExItem { id, name, desc: String::new(), tex: None, hov: 0.0 });
+                        }
+                    }
+                }
+                ExMsg::Card(id, desc, img) => {
+                    if let Some(e) = self.ex_items.iter_mut().find(|e| e.id == id) {
+                        e.desc = desc;
+                        if let Some(c) = img {
+                            e.tex = Some(ctx.load_texture(format!("ex{id}"), c, TextureOptions::LINEAR));
+                        }
+                    }
+                }
+                ExMsg::Done => self.ex_loading = false,
+            }
+        }
+
         // receive loaded assets (at most 2 games' worth of texture uploads per frame, no hitching)
         let mut budget = 2;
         while budget > 0 {
@@ -1887,6 +2463,13 @@ impl eframe::App for App {
             }
             if running {
                 self.was_running = true;
+                if self.prefs.limit > 0 && !self.limit_warned && self.played_today() >= self.prefs.limit as u64 * 60 {
+                    self.limit_warned = true;
+                    self.msg = Some(("Daily playtime limit reached".into(), t));
+                    self.play(Sfx::Error);
+                }
+            } else {
+                self.limit_warned = false;
             }
             self.pad_paused.store(running || !ctx.input(|i| i.focused), Ordering::Relaxed);
 
@@ -1951,6 +2534,10 @@ impl eframe::App for App {
                 if a.back || a.props || esc {
                     self.props = false;
                     self.play(Sfx::Close);
+                }
+            } else if self.settings {
+                if a.back || esc {
+                    self.settings_back();
                 }
             } else {
                 if self.searching {
@@ -2059,6 +2646,13 @@ impl eframe::App for App {
             } else {
                 self.pm += (target - self.pm) * (1.0 - (-14.0 * dt).exp());
             }
+            let st_t = self.settings as u8 as f32;
+            if (st_t - self.sm).abs() < 0.01 {
+                self.sm = st_t;
+            } else {
+                self.sm += (st_t - self.sm) * (1.0 - (-14.0 * dt).exp());
+                self.anim = true;
+            }
 
             // asset requests + free textures far from selection
             if !self.view.is_empty() {
@@ -2119,22 +2713,14 @@ impl eframe::App for App {
             }
             shade(&p, full);
 
-            let sense = if self.props { Sense::hover() } else { csense() };
+            let sense = if self.props || self.settings { Sense::hover() } else { csense() };
             let blur_tex = self.assets.get(&self.bg_cur).and_then(|a| a.blur.clone());
             let blur_uv = blur_tex.as_ref().map(|b| cover_uv(b.size_vec2(), full));
             let bl = blur_tex.as_ref().zip(blur_uv);
 
             let left = full.left() + 72.0;
-            let right = full.right() - 72.0;
 
-            // system monitor + clock
-            p.text(
-                pos2(right, full.top() + 45.0),
-                Align2::RIGHT_CENTER,
-                chrono::Local::now().format("%H:%M").to_string(),
-                fb(15.0),
-                Color32::from_white_alpha(210),
-            );
+            // (clock + settings button are drawn by header_ui)
             // search pill
             if self.searching || !self.search.is_empty() {
                 let r = Rect::from_min_size(pos2(full.left() + 24.0 + 88.0 * 3.0 + 8.0 + 16.0, full.top() + 26.0), vec2(270.0, 38.0));
@@ -2415,7 +3001,7 @@ impl eframe::App for App {
                 let wb = Rect::from_min_max(pos2(full.right() - 72.0 - bar.height(), bar.top()), pos2(full.right() - 72.0, bar.bottom()));
                 let gal = p.layout_no_wrap("Greetings from Lewis".into(), fb(13.0), Color32::WHITE);
                 let full_w = bar.height() + 24.0 + gal.size().x + 8.0;
-                let wt = if !self.props && ui.rect_contains_pointer(Rect::from_min_max(pos2(wb.right() - self.wave_hov.max(0.0) * (full_w - bar.height()) - bar.height(), wb.top()), wb.right_bottom())) { 1.0 } else { 0.0 };
+                let wt = if !self.props && !self.settings && ui.rect_contains_pointer(Rect::from_min_max(pos2(wb.right() - self.wave_hov.max(0.0) * (full_w - bar.height()) - bar.height(), wb.top()), wb.right_bottom())) { 1.0 } else { 0.0 };
                 self.wave_hov += (wt - self.wave_hov) * (1.0 - (-12.0 * dt).exp());
                 if (wt - self.wave_hov).abs() > 0.005 || wt > 0.5 {
                     self.anim = true;
@@ -2565,6 +3151,11 @@ impl eframe::App for App {
                     self.play(Sfx::Close);
                 }
             }
+
+            if self.sm > 0.01 {
+                self.settings_ui(ctx, ui, &p, full, bl, dt);
+            }
+            self.header_ui(ctx, ui, &p, full, bl, dt, t_abs);
 
             let (mut dlg_yes, mut dlg_no) = (false, false);
             if self.ask {
